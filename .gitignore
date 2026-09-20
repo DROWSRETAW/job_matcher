@@ -42,6 +42,11 @@ filter*.json
 focus*.json
 search*.json
 
+# ---- 内部技术文档（本机保留，不公开）----
+# 记录站点接口细节与排查过程，属个人工作笔记，不入公开仓库。
+# 如需公开某篇，用 `git add -f 文件名` 显式加回。
+抓取策略修复说明_*.md
+
 # ---- 本地配置与凭据（本机专属，绝不提交）----
 # local.bat：记录本机 Python 解释器路径，供 run.bat 使用。
 #            模板见 local.bat.example。
