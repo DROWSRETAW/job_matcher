@@ -30,6 +30,18 @@ data/*.db-shm
 output/*
 !output/.gitkeep
 
+# ---- 爬虫自测产物 ----
+# 直接运行 spiders/xmu_career.py（或 run.bat spider）会在项目根目录留下这个文件。
+_spider_out.txt
+
+# ---- 方案文件 ----
+# --save-search / --save-filter 默认写到当前目录，属个人使用产物。
+# 想保留某个方案并提交，用 `git add -f 文件名` 显式加回。
+xiamen*.json
+filter*.json
+focus*.json
+search*.json
+
 # ---- 本地配置与凭据（本机专属，绝不提交）----
 # local.bat：记录本机 Python 解释器路径，供 run.bat 使用。
 #            模板见 local.bat.example。
