@@ -1,0 +1,33 @@
+MIT License
+
+Copyright (c) 2026 DROWSRETAW
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+数据来源说明
+------------
+本项目抓取的是厦门大学就业信息网（https://jy.xmu.edu.cn）上**公开可见**的
+招聘信息，仅用于个人求职场景下的检索与筛选。抓取行为遵守：
+  * 只访问无需登录的公开页面
+  * 请求间隔不低于 1.5 秒，不做高频并发
+  * 不绕过任何验证码或访问控制
+
+仓库中不包含抓取结果（数据库与导出文件均已在 .gitignore 中排除）。

@@ -1,0 +1,13 @@
+# 项目运行依赖
+# 安装：pip install -r requirements.txt
+
+requests>=2.31.0        # HTTP 请求
+beautifulsoup4>=4.12.0  # HTML 解析
+lxml>=5.0.0             # BeautifulSoup 的高性能解析器后端
+pandas>=2.1.0           # 数据处理与 Excel 导出
+openpyxl>=3.1.0         # Excel 读写引擎
+pytest>=7.4.0           # 单元测试框架
+
+# ---- 可选：若目标站点为 JS 动态渲染，取消下面注释 ----
+# playwright>=1.40.0    # 动态页面渲染（需额外执行 playwright install）
+# selenium>=4.15.0      # 备选方案

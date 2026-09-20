@@ -1,0 +1,21 @@
+@echo off
+REM ============================================================
+REM  local.bat.example  --  per-machine interpreter override
+REM
+REM  HOW TO USE
+REM    1. Copy this file to "local.bat" (same folder).
+REM    2. Edit the VENV_PY line below to point at an interpreter
+REM       that has the dependencies from requirements.txt installed.
+REM    3. Delete the file (or comment the line out) to fall back to
+REM       auto-detection of .\.venv -> .\venv -> %PYTHON% -> python.
+REM
+REM  local.bat is listed in .gitignore and is never committed.
+REM
+REM  EXAMPLES
+REM    set "VENV_PY=%~dp0.venv\Scripts\python.exe"
+REM    set "VENV_PY=C:\Python313\python.exe"
+REM    set "VENV_PY=python3"
+REM ============================================================
+
+REM ---- edit the line below ----
+REM set "VENV_PY=%~dp0.venv\Scripts\python.exe"

@@ -1,0 +1,33 @@
+# ============================================================
+#  .gitattributes — 统一行尾与文件类型
+# ============================================================
+# 为什么需要这个文件：
+#   1. Windows 上的批处理(.bat)必须是 CRLF 行尾，否则 cmd.exe 解析
+#      带括号的 if(...) 代码块会出错 —— 这是实测踩过的坑。
+#   2. 强制指定后，无论在哪台机器 clone，checkout 出来的行尾都是对的，
+#      不再依赖各人的 core.autocrlf 设置。
+# ============================================================
+
+# 默认：仓库内统一存 LF，检出时按平台自动转换
+* text=auto eol=lf
+
+# Windows 脚本必须 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.bat.example text eol=crlf
+
+# 二进制文件不做行尾转换、不做 diff
+*.xlsx binary
+*.xls  binary
+*.db   binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+
+# 生成的产物不参与语言统计
+output/* linguist-generated
+*.xlsx linguist-generated
+*.db   linguist-generated

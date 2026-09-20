@@ -1,0 +1,53 @@
+# ============================================================
+#  .gitignore — 厦门在招岗位爬取与匹配筛选系统
+# ============================================================
+
+# ---- Python 运行时产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 运行时数据与导出文件（不入库）----
+# 说明：data/ 与 output/ 无需提交，config.py 启动时会自动创建这两个目录。
+#       库内数据抓取自厦门大学就业信息网，属第三方站点数据，
+#       不适合放进公开仓库；导出文件是运行时产物，每次运行都会重新生成。
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+output/*
+!output/.gitkeep
+
+# ---- 本地配置与凭据（本机专属，绝不提交）----
+# local.bat：记录本机 Python 解释器路径，供 run.bat 使用。
+#            模板见 local.bat.example。
+local.bat
+.env
+.env.*
+*.local.json
+*.log
+logs/
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini

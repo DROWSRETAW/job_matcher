@@ -1,0 +1,373 @@
+# -*- coding: utf-8 -*-
+"""
+检索接口抓取逻辑的单元测试
+==========================
+覆盖 2026-09-20 抓取策略改造中新增/重写的部分：
+
+    1. SearchProfile 的 URL 构造（码表翻译、多专业逗号编码、分页）
+    2. 检索页列表解析 parse_list（9 个字段）
+    3. 分页上限解析 _parse_max_page
+    4. 详情页锚点定位法 _parse_meta_block（旧版本踩坑点，防止回归）
+    5. 需求专业解析 _parse_majors
+    6. 内嵌数据两层解码 decode_embedded_html（含异常输入）
+
+全部为离线测试，不发起网络请求。
+页面片段取自 2026-09-20 对 jy.xmu.edu.cn 的真实抓取结果。
+"""
+import base64
+import sys
+import zlib
+from pathlib import Path
+
+import pytest
+
+# 允许直接 `pytest tests/` 运行
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config import MAJOR_CODES, DEFAULT_MAJOR_KEYS  # noqa: E402
+from core.decoder import decode_embedded_html, probe_encoding, unzip_base64  # noqa: E402
+from spiders.xmu_career import SearchProfile, XmuCareerSpider  # noqa: E402
+
+
+# ===================================================================
+# 真实页面片段（fixture）
+# ===================================================================
+LIST_FRAGMENT = """
+<div class="job-box"><ul class="list">
+<li data-id="2401083">
+<div class="right"><img alt="" src="/attachment/xdu/avatar/a.png"/></div>
+<div class="left">
+  <div class="job">
+    <div class="company">
+      <a href="/company/view/id/1107806" target="_blank">厦门天马微电子有限公司</a>
+      <div><ul><li>制造业</li><li>10000人以上</li></ul></div>
+    </div>
+    <div class="name">
+      <a href="/job/view/id/2401083" target="_blank" title="研发类、智能制造类、职能类等相关岗位">研发类、智能制造类、职能类等相关岗位</a>
+      <span>2026-09-20</span>
+    </div>
+    <div class="salary">
+      <p class="text-orange">9000-25000</p>
+      <ul><li>福建省厦门市</li><li>全职</li><li>本科</li></ul>
+    </div>
+  </div>
+</div>
+<span class="selected-status"></span>
+</li>
+<li data-id="2401052">
+<div class="left">
+  <div class="job">
+    <div class="company">
+      <a href="/company/view/id/1107807" target="_blank">厦门中远海运集装箱运输有限公司</a>
+      <div><ul><li>交通运输、仓储和邮政业</li><li>500-1000人</li></ul></div>
+    </div>
+    <div class="name">
+      <a href="/job/view/id/2401052" target="_blank" title="法务风控岗">法务风控岗</a>
+      <span>2026-09-20</span>
+    </div>
+    <div class="salary">
+      <p class="text-orange">7000-10000</p>
+      <ul><li>福建省厦门市湖里区</li><li>全职</li><li>本科</li></ul>
+    </div>
+  </div>
+</div>
+</li>
+</ul></div>
+"""
+
+PAGINATION_FRAGMENT = """
+<div class="right"><div class="pages clearfix"><ul class="page" id="yw1">
+<li class="previous "><a href="/job/search/city/350200/do123/jy.xmu.edu.cn/domain/xdu">上一页</a></li>
+<li class="page selected"><a href="/job/search/city/350200/do123/jy.xmu.edu.cn/domain/xdu">1</a></li>
+<li class="page"><a href="/job/search/city/350200/do123/jy.xmu.edu.cn/domain/xdu/page/2">2</a></li>
+<li class="page"><a href="javascript:void(0)">...</a></li>
+<li class="page"><a href="/job/search/city/350200/do123/jy.xmu.edu.cn/domain/xdu/page/29">29</a></li>
+<li class="next"><a href="/job/search/city/350200/do123/jy.xmu.edu.cn/domain/xdu/page/2">下一页</a></li>
+</ul></div></div>
+"""
+
+
+# ===================================================================
+# 1. 检索条件与 URL 构造
+# ===================================================================
+class TestSearchProfile:
+    def test_default_matches_luge_profile(self):
+        """默认条件应与卢兄的投递口径一致"""
+        p = SearchProfile()
+        assert p.city == "厦门"
+        assert p.education == "本科"
+        assert p.category == "全职"
+        assert p.majors == DEFAULT_MAJOR_KEYS
+
+    def test_city_code_translation(self):
+        """中文城市名要翻译成行政区划代码，站点不认中文"""
+        assert SearchProfile(city="厦门").to_path() == (
+            "/job/search/city/350200/d_education/101"
+            "/d_category/100/d_major/s112003%2Cs112017%2Cs112002"
+        )
+        assert "/city/350100/" in SearchProfile(city="福州").to_path()
+
+    def test_raw_code_passthrough(self):
+        """直接传代码也应可用（便于临时试验）"""
+        assert "/city/350200/" in SearchProfile(city="350200").to_path()
+        assert "/d_education/101/" in SearchProfile(city="厦门", education="101").to_path()
+
+    def test_major_param_format(self):
+        """专业参数格式：每个带 s 前缀，逗号分隔"""
+        p = SearchProfile(majors=["信息与计算科学", "数学类", "统计学"])
+        assert p._major_param() == "s112003,s112017,s112002"
+
+    def test_major_param_accepts_raw_codes(self):
+        p = SearchProfile(majors=["112003", "s112017"])
+        assert p._major_param() == "s112003,s112017"
+
+    def test_major_param_ignores_unknown(self):
+        assert SearchProfile(majors=["不存在的专业"])._major_param() == ""
+
+    def test_majors_are_url_encoded(self):
+        """逗号必须编码成 %2C，否则多专业参数会被截断"""
+        url = SearchProfile(majors=["信息与计算科学", "数学类"]).to_path()
+        assert "s112003%2Cs112017" in url
+        assert "," not in url
+
+    def test_pagination_only_from_page_two(self):
+        p = SearchProfile()
+        assert "/page/" not in p.to_path(1)
+        assert p.to_path(2).endswith("/page/2")
+        assert p.to_path(16).endswith("/page/16")
+
+    def test_unlimited_education_and_category_omitted(self):
+        """「不限」应完全不出现该参数，而不是传空值"""
+        url = SearchProfile(city="厦门", education="不限", category="不限", majors=[]).to_path()
+        assert "d_education" not in url
+        assert "d_category" not in url
+
+    def test_time_unlimited_omitted(self):
+        """站点的 time=0 表示不限，等价于不传，URL 里应省略"""
+        assert "/time/" not in SearchProfile(time_range="不限").to_path()
+        assert "/time/7" in SearchProfile(time_range="近1周").to_path()
+
+    def test_empty_city_omitted(self):
+        assert "/city/" not in SearchProfile(city="").to_path()
+
+    def test_serialization_roundtrip(self, tmp_path):
+        prof = SearchProfile(city="福州", education="硕士", majors=["统计学"],
+                             time_range="近1周", salary_min=8000)
+        f = tmp_path / "search.json"
+        prof.save(f)
+        loaded = SearchProfile.load(f)
+        assert loaded.to_dict() == prof.to_dict()
+        assert loaded.to_path(2) == prof.to_path(2)
+
+    def test_load_missing_file_returns_default(self, tmp_path):
+        assert SearchProfile.load(tmp_path / "nope.json").to_dict() == SearchProfile().to_dict()
+
+    def test_from_dict_ignores_unknown_keys(self):
+        """方案文件多写字段不应导致崩溃"""
+        p = SearchProfile.from_dict({"city": "厦门", "未来的字段": 1})
+        assert p.city == "厦门"
+
+
+# ===================================================================
+# 2. 检索页列表解析
+# ===================================================================
+class TestParseList:
+    @pytest.fixture
+    def spider(self):
+        return XmuCareerSpider(fetch_detail=False)
+
+    def test_parses_all_items(self, spider):
+        jobs = spider.parse_list(LIST_FRAGMENT, "http://x/job/search")
+        assert len(jobs) == 2
+
+    def test_first_item_fields(self, spider):
+        job = spider.parse_list(LIST_FRAGMENT, "http://x/job/search")[0]
+        assert job.company == "厦门天马微电子有限公司"
+        assert job.title == "研发类、智能制造类、职能类等相关岗位"
+        assert job.salary == "9000-25000"
+        assert job.city == "福建省厦门市"
+        assert job.education == "本科"
+        assert job.url == "https://jy.xmu.edu.cn/job/view/id/2401083"
+
+    def test_second_item_fields(self, spider):
+        """第二条的薪资/城市不能串到第一条去（曾因正则跨层解析出过错）"""
+        job = spider.parse_list(LIST_FRAGMENT, "http://x/job/search")[1]
+        assert job.title == "法务风控岗"
+        assert job.city == "福建省厦门市湖里区"
+        assert job.salary == "7000-10000"
+
+    def test_major_left_empty_for_detail_stage(self, spider):
+        """列表页本来就没有「需求专业」，必须留空由详情页补"""
+        for job in spider.parse_list(LIST_FRAGMENT, "http://x/job/search"):
+            assert job.major_requirement == ""
+
+    def test_no_items_returns_empty(self, spider):
+        assert spider.parse_list("<div>暂无数据</div>", "http://x") == []
+
+    def test_jid_extraction(self):
+        assert XmuCareerSpider._jid_of(
+            "https://jy.xmu.edu.cn/job/view/id/2401083") == "2401083"
+        assert XmuCareerSpider._jid_of("") == ""
+        assert XmuCareerSpider._jid_of("https://jy.xmu.edu.cn/company/view/id/1") == ""
+
+
+# ===================================================================
+# 3. 分页
+# ===================================================================
+class TestPagination:
+    def test_max_page_from_tail_links(self):
+        """分页链接里夹着模板附加段，只应识别 /page/N"""
+        assert XmuCareerSpider._parse_max_page(PAGINATION_FRAGMENT) == 29
+
+    def test_single_page_when_no_pagination(self):
+        assert XmuCareerSpider._parse_max_page(LIST_FRAGMENT) == 1
+
+
+# ===================================================================
+# 4. 详情页锚点定位法（旧版本踩坑点）
+# ===================================================================
+class TestMetaBlock:
+    def test_parses_fixed_line_order(self):
+        """
+        真实行序：薪资 / '|' / 城市 / '|' / 性质 / '|' / 学历
+        —— '|' 是独立的一行，不是行内分隔符。这是旧版本的解析 bug 来源。
+        """
+        lines = [
+            "27届校招-游戏数值策划",
+            "7000-10000",
+            "|",
+            "福建省厦门市思明区",
+            "|",
+            "全职",
+            "|",
+            "本科",
+            "职位收藏 投递简历 完善简历",
+            "2026-09-03",
+            "浏览次数：123",
+        ]
+        meta = XmuCareerSpider._parse_meta_block(lines)
+        assert meta["salary"] == "7000-10000"
+        assert meta["city"] == "福建省厦门市思明区"
+        assert meta["job_nature"] == "全职"
+        assert meta["education"] == "本科"
+        assert meta["publish_date"] == "2026-09-03"
+
+    def test_handles_tilde_salary(self):
+        meta = XmuCareerSpider._parse_meta_block(["X", "8000~12000", "|", "福建省厦门市"])
+        assert meta["salary"] == "8000-12000"
+
+    def test_falls_back_to_negotiable(self):
+        meta = XmuCareerSpider._parse_meta_block(["X", "薪资：面议", "|", "福建省厦门市"])
+        assert meta["salary"] == "面议"
+        assert meta["city"] == "福建省厦门市"
+
+    def test_no_salary_returns_empty(self):
+        meta = XmuCareerSpider._parse_meta_block(["X", "Y", "Z"])
+        assert meta["salary"] == ""
+
+
+# ===================================================================
+# 5. 需求专业解析
+# ===================================================================
+class TestParseMajors:
+    def test_strips_education_tags(self):
+        """去掉【本科】这类学历前缀标签；单逗号分隔保留原样"""
+        text = ("需求专业：【本科】汉语言文学,【本科】信息与计算科学,"
+                "【本科】数学类 职位详情 单位介绍")
+        assert XmuCareerSpider._parse_majors(text) == "汉语言文学,信息与计算科学,数学类"
+
+    def test_collapses_repeated_separators(self):
+        """连续多个分隔符会被折叠（站点偶尔出现 ",," 或 "、、"）"""
+        text = "需求专业：数学类,,统计学、、计算机类 职位详情"
+        assert XmuCareerSpider._parse_majors(text) == "数学类、统计学、计算机类"
+
+    def test_missing_field_returns_empty(self):
+        assert XmuCareerSpider._parse_majors("职位详情 无专业字段") == ""
+
+    def test_handles_fullwidth_colon(self):
+        text = "需求专业：【本科】统计学 职位详情"
+        assert XmuCareerSpider._parse_majors(text) == "统计学"
+
+
+# ===================================================================
+# 6. 内嵌数据两层解码
+# ===================================================================
+def _incompressible(n: int = 600) -> str:
+    """
+    生成压缩率低的内容。
+
+    必要性：解码器只把长度 >=200 的 base64 串当作候选（避免误匹配普通
+    字符串）。若测试内容高度重复（如 "x"*300），zlib 会把它压到几十字节，
+    编码后达不到阈值——这是测试用例本身的坑，不是解码器的 bug。
+    """
+    import random
+    rnd = random.Random(20260920)
+    return "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(n))
+
+
+class TestDecoder:
+    @staticmethod
+    def _wrap(inner_html: str) -> str:
+        """按站点的方式造一个两层编码的页面"""
+        lv2 = base64.b64encode(inner_html.encode("utf-8")).decode()
+        lv1 = base64.b64encode(zlib.compress(("view2d " + lv2).encode())).decode()
+        return f'<script>{{"a"}}$("#c").replaceWith(Base64.decode(unzip("{lv1}")));</script>'
+
+    def test_two_layer_roundtrip(self):
+        inner = "<div class='job-box'><ul class='list'>" + \
+                "".join(f"<li data-id='{i}'>item{i}</li>" for i in range(30)) + \
+                "</ul></div>"
+        assert decode_embedded_html(self._wrap(inner)) == inner
+
+    def test_single_layer_returns_layer1(self):
+        """只有一层压缩时，应退回第 1 层结果而不是返回空"""
+        raw = _incompressible(600)
+        lv1 = base64.b64encode(zlib.compress(raw.encode())).decode()
+        assert len(lv1) >= 200, "测试内容编码后未达候选阈值，请加大长度"
+        page = f'<script>unzip("{lv1}")</script>'
+        assert decode_embedded_html(page) == raw
+
+    def test_empty_input(self):
+        assert decode_embedded_html("") == ""
+
+    def test_no_candidate(self):
+        assert decode_embedded_html("<html>no embedded data</html>") == ""
+
+    def test_bad_base64_does_not_raise(self):
+        long_junk = "!" * 300      # 不是合法 base64，且不符合候选正则
+        assert decode_embedded_html(f"<script>{long_junk}</script>") == ""
+
+    def test_probe_encoding_reports_state(self):
+        inner = _incompressible(600)
+        info = probe_encoding(self._wrap(inner))
+        assert info["has_candidate"] is True
+        assert info["layer1_ok"] is True
+        assert info["wrapper"] == "view2d"
+        assert info["layer2_ok"] is True
+        assert info["layer2_len"] == len(inner)
+
+    def test_unzip_invalid_returns_none(self):
+        assert unzip_base64("not-base64!!") is None
+
+
+# ===================================================================
+# 7. 码表完整性
+# ===================================================================
+class TestCodeTables:
+    def test_required_cities(self):
+        from config import CITY_CODES
+        for name in ["厦门", "福州", "福建", "深圳"]:
+            assert name in CITY_CODES
+            assert CITY_CODES[name].isdigit()
+
+    def test_luge_major_codes_present(self):
+        for name in DEFAULT_MAJOR_KEYS:
+            assert name in MAJOR_CODES
+
+    def test_major_codes_are_six_digits(self):
+        for name, code in MAJOR_CODES.items():
+            assert len(code) == 6 and code.isdigit(), f"{name} 的代码不合法：{code}"
+
+    def test_xinxiyujisuan_kexue_code(self):
+        """这个代码错了，整个专业筛选就失效"""
+        assert MAJOR_CODES["信息与计算科学"] == "112003"
