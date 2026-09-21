@@ -13,6 +13,8 @@ REM    run.bat --stats              database overview
 REM    run.bat -h                   list all options
 REM    run.bat test                 run all unit tests
 REM    run.bat spider               test the XMU crawler alone
+REM    run.bat ods                  ODS layer + crawl batch ledger
+REM    run.bat rebuild              rebuild state layer from ODS (offline)
 REM
 REM  NOTE: keep this file in GBK + CRLF encoding. Do not "fix" it to
 REM  UTF-8; cmd.exe on zh-CN Windows will garble it. .gitattributes
@@ -67,6 +69,22 @@ if /i "%~1"=="test" (
 if /i "%~1"=="spider" (
     echo [单独测试厦大就业网爬虫]
     "%VENV_PY%" spiders\xmu_career.py
+    echo.
+    pause
+    exit /b 0
+)
+
+if /i "%~1"=="ods" (
+    echo [ODS 贴源层概览 ^| 快照数量与历次抓取批次]
+    "%VENV_PY%" main.py --ods-stats
+    echo.
+    pause
+    exit /b 0
+)
+
+if /i "%~1"=="rebuild" (
+    echo [从 ODS 原始快照重建最新状态层 ^| 不联网]
+    "%VENV_PY%" main.py --rebuild-state
     echo.
     pause
     exit /b 0

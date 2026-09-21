@@ -89,6 +89,38 @@
 仍然是项目的差异化价值所在——两者分工，不互相替代。
 
 ────────────────────────────────────────────────────────────────
+【增量运行（2026-09-21 新增）】
+────────────────────────────────────────────────────────────────
+第 2 段是全部开销的大头：每岗位 1 次详情请求、每次节流 1.6 秒，
+全量 300 条就要 8 分钟，占整个流程耗时的 94%。
+但这些详情字段在两次抓取之间绝大多数不会变，所以默认改成按需抓：
+
+    第 1 段列表页  照常全量翻 —— 它是「有没有新岗位」的唯一来源，
+                   而且只要 20 多秒，省它没有意义
+    第 2 段详情页  只抓「该抓的」：
+                      · 新出现的职位
+                      · 列表字段（标题/薪资/城市/学历/发布日期）有变的
+                      · 历史上从没抓到过「需求专业」的
+                      · 距上次抓详情超过 TTL（默认 7 天）的
+                   其余跳过，专业与截止时间从 ODS 历史快照回填
+
+实测（厦门+本科+全职，20 条岗位）：
+    第 1 次（全新建库）  列表 1 次 + 详情 20 次   约 40 秒
+    第 2 次（同一条件）  列表 1 次 + 详情 0 次    约 1 秒
+
+两点必须记住：
+  1. **跳过详情 ≠ 丢字段**。被跳过的岗位会从 ODS 里「最近一次真正抓到
+     详情的快照」回填 major_requirement / deadline（见
+     core/incremental.apply_backfill）。回填缺失会把数据源越跑越空。
+  2. **抓失败也要回填**。网络抖动导致这轮没抓到，不代表这岗位没有专业
+     要求——此时必须用历史值兜住，否则一次失败就把库里的字段抹成空。
+
+增量决策本身不写在爬虫里，而是 core/incremental.py 的纯函数
+plan_detail_fetch()（输入列表结果 + ODS 状态，输出抓取计划）。
+好处是全部判定分支都能脱离网络单测；混进这里就必须造 HTTP 才能测。
+爬虫只负责执行计划：enrich_by_plan()。
+
+────────────────────────────────────────────────────────────────
 【合规声明】
 - 仅抓取公开可访问页面，不登录、不绕过验证码
 - 站点 robots.txt 不存在（404），无显式禁止
@@ -116,7 +148,7 @@ from config import (
     NATURE_CODES, SCALE_CODES, MAJOR_CODES, DEFAULT_MAJOR_KEYS,
 )
 from core.decoder import decode_embedded_html, probe_encoding
-from core.models import Job
+from core.models import Job, make_job_key, list_fingerprint
 from core.fetcher import fetch, build_session
 from spiders.base_spider import BaseSpider
 
@@ -297,15 +329,23 @@ class XmuCareerSpider(BaseSpider):
             "detail_requests": 0,
             "detail_ok": 0,
             "detail_major_found": 0,
+            # ---- 增量相关（2026-09-21 新增）----
+            "detail_skipped": 0,     # 因增量判定而省下的详情请求数
+            "backfilled": 0,         # 用历史快照回填了专业字段的岗位数
         }
 
     # -----------------------------------------------------------------
     # 主流程
     # -----------------------------------------------------------------
-    def run(self) -> List[Job]:
+    def run(self, plan=None) -> List[Job]:
         """
         完整抓取：检索页取列表 -> 详情页补专业。
 
+        :param plan: core.incremental.DetailPlan（可选）。
+            不传 → 按 fetch_detail 全量抓详情（改造前的行为）。
+            传入 → 只抓计划中标记要抓的岗位，其余从历史快照回填。
+            增量决策本身不在这里做：plan 要基于列表结果和 ODS 状态
+            才能算出来，属于编排层的职责（见 main.py）。
         :return: 岗位列表（未打分，打分在 core/matcher.py）
         """
         jobs = self.search(self.profile)
@@ -313,12 +353,18 @@ class XmuCareerSpider(BaseSpider):
             self.logger.warning("检索结果为空，请检查检索条件是否正确")
             return []
 
-        if self.fetch_detail:
+        if plan is not None:
+            self.enrich_by_plan(plan)
+        elif self.fetch_detail:
             self.enrich_majors(jobs)
 
-        self.logger.info("抓取完成：%d 个岗位（列表请求 %d 次，详情请求 %d 次）",
-                         len(jobs), self.stats["list_requests"],
-                         self.stats["detail_requests"])
+        self.finalize(jobs)
+
+        self.logger.info(
+            "抓取完成：%d 个岗位（列表请求 %d 次，详情请求 %d 次，"
+            "增量省下 %d 次详情请求）",
+            len(jobs), self.stats["list_requests"],
+            self.stats["detail_requests"], self.stats["detail_skipped"])
         return jobs
 
     # =================================================================
@@ -480,11 +526,21 @@ class XmuCareerSpider(BaseSpider):
                 salary=salary,
                 education=education,
                 major_requirement="",     # ★ 列表页没有，由详情页补
-                deadline=publish_date,    # 发布日先占位，详情页若有过期时间会覆盖
+                deadline="",              # 同理；抓不到详情时用发布日期兜底
+                publish_date=publish_date,  # 独立记录发布日期，供增量判定
                 apply_method=url,
                 source="厦门大学就业信息网",
                 url=url,
+                # 列表页唯一稳定的主键是职位 ID（data-id 属性）
+                source_job_id=jid,
+                job_key=make_job_key(jid),
             )
+            # 列表指纹在结果返回前就固定下来：
+            # 详情页回填会改 deadline，若把指纹算在回填之后，
+            # 下次抓取时的列表指纹（此时详情还没抓）就会与之不等，
+            # 导致所有岗位被误判成「信息有变」而全量重抓。
+            job.list_hash = list_fingerprint(job)
+
             if job.is_valid():
                 jobs.append(job)
 
@@ -495,15 +551,7 @@ class XmuCareerSpider(BaseSpider):
     # =================================================================
     def enrich_majors(self, jobs: List[Job]) -> None:
         """
-        逐条抓详情页，补齐列表页拿不到的「需求专业」（+ 截止时间）。
-
-        为什么要单独一趟：
-            检索页的列表项**只有 9 个字段**，没有需求专业。而
-            core/matcher.py 的权重表把「信息与计算科学」「数学类」
-            放在最高权重档——没有这个字段，打分等于瘸腿。
-            实测详情页 /job/view/id/{jid} 的静态 HTML 里数据完整
-            （旧版本踩过的坑是公告页 /campus/view/id/ 正文缺失 80%，
-             所以必须走职位页，不能走公告页）。
+        全量抓详情页，补齐列表页拿不到的「需求专业」（+ 截止时间）。
 
         :param jobs: 原地修改，回填 major_requirement / deadline
         """
@@ -511,6 +559,72 @@ class XmuCareerSpider(BaseSpider):
         if self.detail_limit:
             target = jobs[: self.detail_limit]
             self.logger.info("按 detail_limit 仅补前 %d 条详情", len(target))
+
+        self._fetch_detail_loop(target)
+
+    def enrich_by_plan(self, plan) -> None:
+        """
+        按增量计划抓详情页。
+
+        :param plan: core.incremental.DetailPlan
+
+        比 enrich_majors 多做三件事：
+          1. 只抓计划里标记为「需要抓」的岗位（新增 / 信息有变 / 缺专业 / 超期）
+          2. 跳过的岗位用 ODS 历史快照回填专业与截止时间
+          3. 抓失败的岗位也用历史快照兜底 —— 抓取失败只代表这次没拿到，
+             不代表这个岗位没有专业要求，不能因此把库里已有值抹掉
+
+        为什么把决策写在 core/incremental.py 而不是这里：
+            那是纯函数（输入列表 + 状态，输出计划），可以脱离网络单独
+            单测全部判定分支；混进爬虫里就必须造 HTTP 才能测。
+        """
+        from core.incremental import apply_backfill, summarize_plan
+
+        for line in summarize_plan(plan):
+            self.logger.info("%s", line)
+
+        self.stats["detail_skipped"] = plan.skipped_count
+
+        target = plan.to_fetch
+        if self.detail_limit:
+            target = target[: self.detail_limit]
+            self.logger.info("按 detail_limit 本批最多抓 %d 条详情", len(target))
+
+        # 先回填被跳过的：它们的字段全部来自历史快照
+        filled = apply_backfill(plan)
+        self.stats["backfilled"] = filled
+        if plan.skipped_count:
+            self.logger.info(
+                "跳过 %d 条详情，其中 %d 条已从历史快照回填专业字段",
+                plan.skipped_count, filled)
+
+        before_ok = self.stats["detail_ok"]
+        self._fetch_detail_loop(target)
+
+        failed = [j for j in target if not j.detail_fetched]
+        if failed:
+            rescued = 0
+            for job in failed:
+                major, deadline = plan.backfill.get(job.job_key, ("", ""))
+                if major:
+                    job.major_requirement = major
+                    rescued += 1
+                if deadline and not job.deadline:
+                    job.deadline = deadline
+            self.logger.warning(
+                "%d 条详情抓取失败（成功 %d 条），已用历史快照兜住 %d 条的专业字段；"
+                "失败的下次运行会重试",
+                len(failed), self.stats["detail_ok"] - before_ok, rescued)
+
+    def _fetch_detail_loop(self, target: List[Job]) -> None:
+        """
+        逐条抓详情页并回填（enrich_majors 与 enrich_by_plan 共用的循环体）。
+
+        只回填「需求专业」和「截止时间」——公司名/岗位名保持列表页的值，
+        因为它们参与数据库的去重判断，改写可能让同一岗位重复入库。
+        """
+        if not target:
+            return
 
         self.logger.info("开始抓取详情页补「需求专业」，共 %d 个岗位，"
                          "预计约 %.1f 分钟",
@@ -523,12 +637,13 @@ class XmuCareerSpider(BaseSpider):
 
             detail = self._fetch_job_page(jid)
             if detail:
-                # 只回填「需求专业」和「截止时间」。
-                # 公司名/岗位名保持列表页的值——它们同时是数据库去重键
-                # （UNIQUE(company, title)），改写会导致同一岗位重复入库。
                 job.major_requirement = detail.major_requirement or ""
                 if detail.deadline:
                     job.deadline = detail.deadline
+                # 页面成功解析即算「这次真抓到了详情」。
+                # 若页面本身没写专业要求（parse 会返回空列表），
+                # detail_fetched 仍为 False，下次会再试一次。
+                job.detail_fetched = True
                 if job.major_requirement:
                     self.stats["detail_major_found"] += 1
 
@@ -538,6 +653,19 @@ class XmuCareerSpider(BaseSpider):
 
             if i < len(target):
                 time.sleep(self.detail_delay)
+
+    @staticmethod
+    def finalize(jobs: List[Job]) -> None:
+        """
+        抓取收尾：给没有截止时间的岗位用发布日期兜底。
+
+        为什么要有这一步：列表页展示的是发布日期，详情页才有「过期时间」。
+        详情没抓（增量跳过 / 关闭详情 / 抓失败）时，deadline 会是空的，
+        导出到 Excel 就是一片空白。用发布日期兜底，至少信息不为空。
+        """
+        for job in jobs:
+            if not job.deadline:
+                job.deadline = job.publish_date
 
     def _fetch_job_page(self, jid: str) -> Optional[Job]:
         """抓取并解析单个职位详情页；失败返回 None"""
