@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     deadline        TEXT,
     source          TEXT,
     url             TEXT,
+    industry        TEXT,
+    company_nature  TEXT,
+    company_scale   TEXT,
     match_score     INTEGER DEFAULT 0,
     match_level     TEXT,
     match_label     TEXT,
@@ -95,20 +98,27 @@ MIGRATION_COLUMNS = {
     "content_hash": "TEXT",
     "change_count": "INTEGER NOT NULL DEFAULT 0",
     "is_active": "INTEGER NOT NULL DEFAULT 1",
+    # 单位属性（2026-09-23 新增）。老记录补列后为 NULL，
+    # 下次抓取时会被站点值填上——不需要清库重来。
+    "industry": "TEXT",
+    "company_nature": "TEXT",
+    "company_scale": "TEXT",
 }
 
 
 INSERT_SQL = """
 INSERT INTO jobs
     (company, title, city, salary, education, major_requirement,
-     apply_method, deadline, source, url, match_score,
+     apply_method, deadline, source, url, industry, company_nature,
+     company_scale, match_score,
      match_level, match_label, hit_keywords, crawl_time,
      job_key, source_job_id, publish_date,
      first_seen_at, last_seen_at, last_batch_id,
      content_hash, change_count, is_active)
 VALUES
     (:company, :title, :city, :salary, :education, :major_requirement,
-     :apply_method, :deadline, :source, :url, :match_score,
+     :apply_method, :deadline, :source, :url, :industry, :company_nature,
+     :company_scale, :match_score,
      :match_level, :match_label, :hit_keywords, :crawl_time,
      :job_key, :source_job_id, :publish_date,
      :now, :now, :last_batch_id,
@@ -120,6 +130,10 @@ VALUES
 #   · change_count 只在内容指纹变了时 +1（:delta 由调用方算好）
 #   · is_active 置回 1 —— 它又出现在列表里了，说明还在招
 #   · job_key 用 COALESCE 兜底赋值，让老记录在首次被重新抓到时补上主键
+#   · 单位属性（industry / company_nature / company_scale）用 COALESCE + NULLIF
+#     保护：这三项在「跳过详情且无历史可回填」时会算出来是空字符串，
+#     无条件覆盖会把库里已有的值抹掉。信息缺失 ≠ 信息为空，
+#     空值不能反过来当成「站点说这里没有」。
 UPDATE_SQL = """
 UPDATE jobs SET
     company           = :company,
@@ -132,6 +146,9 @@ UPDATE jobs SET
     deadline          = :deadline,
     source            = :source,
     url               = :url,
+    industry          = COALESCE(NULLIF(:industry, ''), industry),
+    company_nature    = COALESCE(NULLIF(:company_nature, ''), company_nature),
+    company_scale     = COALESCE(NULLIF(:company_scale, ''), company_scale),
     match_score       = :match_score,
     match_level       = :match_level,
     match_label       = :match_label,
@@ -358,6 +375,9 @@ class JobStorage:
                 publish_date=row["publish_date"] or "",
                 source=row["source"] or "",
                 url=row["url"] or "",
+                industry=row["industry"] or "",
+                company_nature=row["company_nature"] or "",
+                company_scale=row["company_scale"] or "",
                 job_key=key,
                 source_job_id=row["source_job_id"] or "",
                 crawl_time=row["crawled_at"] or "",
@@ -495,6 +515,9 @@ class JobStorage:
                 major_requirement=r["major_requirement"],
                 apply_method=r["apply_method"], deadline=r["deadline"],
                 source=r["source"], url=r["url"],
+                industry=r["industry"] or "",
+                company_nature=r["company_nature"] or "",
+                company_scale=r["company_scale"] or "",
                 match_score=r["match_score"], match_level=r["match_level"],
                 match_label=r["match_label"],
                 hit_keywords=[k for k in kw.split(",") if k],

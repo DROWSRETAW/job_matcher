@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS ods_job_snapshot (
     deadline          TEXT,
     publish_date      TEXT,
     url               TEXT,
+    -- ---- 单位属性（2026-09-23 新增，站点原样值，不做归一化）----
+    -- 归一化属于 DWD 的职责，ODS 只如实记录页面怎么写的
+    industry          TEXT,
+    company_nature    TEXT,
+    company_scale     TEXT,
     -- ---- 指纹与状态标记 ----
     list_hash         TEXT NOT NULL,
     content_hash      TEXT NOT NULL,
@@ -128,6 +133,9 @@ SNAPSHOT_MIGRATION_COLUMNS = {
     "list_hash": "TEXT",
     "content_hash": "TEXT",
     "detail_fetched": "INTEGER NOT NULL DEFAULT 0",
+    "industry": "TEXT",
+    "company_nature": "TEXT",
+    "company_scale": "TEXT",
 }
 
 
@@ -156,6 +164,12 @@ class JobState:
     detail_at: str = ""            # 最近一次真正抓到详情的时刻（"" = 从未）
     major_requirement: str = ""    # 来自 detail_at 那条快照
     deadline: str = ""
+    # 单位属性同理，来自 detail_at 那条快照：
+    # company_nature 只有详情页有，是这三项里真正会被用到的回填来源；
+    # industry / company_scale 列表页本来就有，这里是列表页偶发缺值时的兜底。
+    industry: str = ""
+    company_nature: str = ""
+    company_scale: str = ""
     change_count: int = 0          # 历史上内容指纹发生变化的次数
 
     @property
@@ -352,8 +366,10 @@ class OdsRepository:
                         (job_key, source, source_job_id, batch_id, crawled_at,
                          company, title, city, salary, education,
                          major_requirement, apply_method, deadline, publish_date,
-                         url, list_hash, content_hash, detail_fetched)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         url, industry, company_nature, company_scale,
+                         list_hash, content_hash, detail_fetched)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -364,7 +380,8 @@ class OdsRepository:
                         job.company, job.title, job.city, job.salary,
                         job.education, job.major_requirement,
                         job.apply_method, job.deadline, job.publish_date,
-                        job.url,
+                        job.url, job.industry, job.company_nature,
+                        job.company_scale,
                         list_fingerprint(job),
                         content_fingerprint(job),
                         1 if job.detail_fetched else 0,
@@ -411,6 +428,9 @@ class OdsRepository:
                 detail_at=(detail["crawled_at"] if detail else ""),
                 major_requirement=((detail["major_requirement"] if detail else "") or ""),
                 deadline=((detail["deadline"] if detail else "") or ""),
+                industry=((detail["industry"] if detail else "") or ""),
+                company_nature=((detail["company_nature"] if detail else "") or ""),
+                company_scale=((detail["company_scale"] if detail else "") or ""),
                 change_count=changes.get(key, 0),
             )
         return states

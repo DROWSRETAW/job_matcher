@@ -46,14 +46,19 @@
 ────────────────────────────────────────────────────────────────
 【回填：跳过详情不等于丢掉字段】
 ────────────────────────────────────────────────────────────────
-被跳过的岗位，major_requirement 会是空的。直接写库会把这个字段抹掉，
-所以要从 ODS 里取该岗位**最近一次真正抓到详情的快照**填回去。
-这是 ODS 只追加（append-only）带来的直接能力——
+被跳过的岗位，major_requirement / company_nature 会是空的。直接写库
+会把这些字段抹掉，所以要从 ODS 里取该岗位**最近一次真正抓到详情的
+快照**填回去。这是 ODS 只追加（append-only）带来的直接能力——
 历史抓到的事实都还在，随时能取回来。
+
+回填的字段清单见 BackfillFields。它有一个容易被忽略的硬约束：
+**凡是登记进内容指纹的字段，都必须在跳过详情时也能被还原**，
+否则同一条岗位在「抓了详情」和「跳过详情」两种情况下会算出不同指纹，
+变更统计会静默地虚增。
 """
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set
 
 from config import (
     INCREMENTAL_ENABLED,
@@ -74,6 +79,44 @@ REASON_FORCED = "forced"            # 增量关闭，全量抓
 
 
 @dataclass
+class BackfillFields:
+    """
+    跳过详情页时，需要用 ODS 历史还原的字段集合（2026-09-23 新增）。
+
+    【为什么这些字段必须**成组**还原，而不是各管各的】
+        它们都登记在内容指纹里（见 core/models.py 的 CONTENT_FINGERPRINT_FIELDS）。
+        增量跑跳过详情时，这些字段在内存对象里是空的，如果直接写库，
+        同一条岗位就会算出与上一条快照**不同**的指纹——表象是
+        change_count 每天虚增、--ods-changes 里堆满假变化，
+        根因只是漏还原了一个字段，而且不会报任何错。
+        所以「进内容指纹」和「能回填」是一对必须同时成立的约束。
+        抽成结构体而不是二元组，就是为了以后再加字段时，
+        回填循环能自动覆盖，不必再去改两处解包代码。
+
+    【各字段的来源，以及它到底会不会缺】
+        major_requirement / deadline   只有详情页有 → 跳过详情必缺
+        company_nature                 只有详情页有 → 跳过详情必缺
+        industry / company_scale       列表页就有，正常不会缺；留着是为了
+                                       列表页偶发缺值时也有历史兜底
+    """
+    major_requirement: str = ""
+    deadline: str = ""
+    company_nature: str = ""
+    industry: str = ""
+    company_scale: str = ""
+
+    def as_items(self):
+        """(字段名, 值) 序列，供回填循环按名字赋值"""
+        return (
+            ("major_requirement", self.major_requirement),
+            ("deadline", self.deadline),
+            ("company_nature", self.company_nature),
+            ("industry", self.industry),
+            ("company_scale", self.company_scale),
+        )
+
+
+@dataclass
 class DetailPlan:
     """
     详情页抓取计划。
@@ -84,7 +127,7 @@ class DetailPlan:
     """
     to_fetch: List[Job] = field(default_factory=list)
     skipped: List[Job] = field(default_factory=list)
-    backfill: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    backfill: Dict[str, BackfillFields] = field(default_factory=dict)
     reasons: Dict[str, str] = field(default_factory=dict)
 
     # 本批未在列表中出现的已知岗位（可能已下架，由调用方决定怎么处理）
@@ -172,7 +215,13 @@ def plan_detail_fetch(
         #      就会把库里的「需求专业」抹成空字符串，而这只是抓取失败，
         #      不是「这个岗位没有专业要求」。信息缺失 ≠ 信息为空。
         if state is not None and state.has_detail:
-            plan.backfill[key] = (state.major_requirement, state.deadline)
+            plan.backfill[key] = BackfillFields(
+                major_requirement=state.major_requirement,
+                deadline=state.deadline,
+                company_nature=state.company_nature,
+                industry=state.industry,
+                company_scale=state.company_scale,
+            )
 
         # ---- 规则 1：增量关闭 ----
         if not enabled:
@@ -222,16 +271,22 @@ def apply_backfill(plan: DetailPlan) -> int:
     与赋值（改对象）是两件事：测试判定规则时不必构造完整 Job，
     而且回填只能在真正跳过详情时执行，顺序上更容易看清。
 
+    【回填规则：只补空值，不覆盖本次已抓到的】
+        industry / company_scale 这类列表页就有的字段，本次解析已经拿到
+        更新的值了，不该被历史快照里的旧值盖回去。
+        所以统一用「缺失才填」，而不是无条件赋值。
+
     :return: 实际回填了专业字段的岗位数
     """
     filled = 0
     for job in plan.skipped:
-        major, deadline = plan.backfill.get(job.job_key, ("", ""))
-        if major:
-            job.major_requirement = major
-            filled += 1
-        if deadline:
-            job.deadline = deadline
+        recovery = plan.backfill.get(job.job_key)
+        if recovery is not None:
+            for name, value in recovery.as_items():
+                if value and not getattr(job, name, ""):
+                    setattr(job, name, value)
+            if recovery.major_requirement:
+                filled += 1
         job.detail_fetched = False
     return filled
 

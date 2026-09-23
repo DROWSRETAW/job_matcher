@@ -201,6 +201,62 @@ class TestParseList:
         for job in spider.parse_list(LIST_FRAGMENT, "http://x/job/search"):
             assert job.major_requirement == ""
 
+    # ---- 单位行业 / 单位规模（2026-09-23 新增）----
+    def test_extracts_company_industry_and_scale(self, spider):
+        """
+        公司名下方的嵌套 <ul> 是「单位行业 / 单位规模」。
+
+        此前只取了 .salary 那个 ul，这两个字段被静默丢弃，
+        直接导致「城市 × 行业」这个分析维度在设计上不可能成立。
+        """
+        jobs = spider.parse_list(LIST_FRAGMENT, "http://x/job/search")
+        assert jobs[0].industry == "制造业"
+        assert jobs[0].company_scale == "10000人以上"
+        assert jobs[1].industry == "交通运输、仓储和邮政业"
+        assert jobs[1].company_scale == "500-1000人"
+
+    def test_company_nature_left_empty_on_list_page(self, spider):
+        """
+        列表页的「全职」是**工作性质**，不是**单位性质**，不能张冠李戴。
+
+        单位性质（国有企业 / 事业单位…）只有详情页有，列表阶段必须留空，
+        由详情页补。若这里错填了「全职」，整列数据都是错的且不易发现。
+        """
+        for job in spider.parse_list(LIST_FRAGMENT, "http://x/job/search"):
+            assert job.company_nature == ""
+
+    def test_two_uls_do_not_cross_contaminate(self, spider):
+        """
+        ★ 列表项里有两个 <ul>（公司块、薪资块），不能取串。
+
+        若把 `.company ul` 和 `.salary ul` 混用，城市会变成「制造业」、
+        学历会变成「10000人以上」——而且长得像正常数据，极难发现。
+        """
+        jobs = spider.parse_list(LIST_FRAGMENT, "http://x/job/search")
+        assert jobs[0].city == "福建省厦门市"      # 来自 .salary ul
+        assert jobs[0].education == "本科"
+        assert jobs[0].industry == "制造业"        # 来自 .company ul
+        assert jobs[0].industry not in (jobs[0].city, jobs[0].education)
+
+    def test_missing_company_ul_does_not_break_other_fields(self, spider):
+        """公司块缺失（站点偶发）时，城市/薪资/学历仍要正常解析"""
+        fragment = """
+        <ul class="list"><li data-id="2401099">
+          <div class="left"><div class="job">
+            <div class="company"><a href="/company/view/id/1">某公司</a></div>
+            <div class="name"><a href="/job/view/id/2401099" title="数据开发">数据开发</a>
+              <span>2026-09-20</span></div>
+            <div class="salary"><p class="text-orange">9000-12000</p>
+              <ul><li>福建省厦门市集美区</li><li>全职</li><li>本科</li></ul></div>
+          </div></div>
+        </li></ul>
+        """
+        job = spider.parse_list(fragment, "http://x/job/search")[0]
+        assert job.city == "福建省厦门市集美区"
+        assert job.salary == "9000-12000"
+        assert job.education == "本科"
+        assert job.industry == "" and job.company_scale == ""
+
     def test_no_items_returns_empty(self, spider):
         assert spider.parse_list("<div>暂无数据</div>", "http://x") == []
 
@@ -290,7 +346,126 @@ class TestParseMajors:
 
 
 # ===================================================================
-# 6. 内嵌数据两层解码
+# 6. 单位属性解析（2026-09-23 新增）
+# ===================================================================
+# 真实结构，取自 2026-09-23 对 jy.xmu.edu.cn 详情页的抓取结果
+COMPANY_BLOCK_FRAGMENT = """
+<div class="info"><div style="padding-top: 15px;">
+  <div class="item"><label class="label">单位性质：</label><span>国有企业</span></div>
+  <div class="item"><label class="label">单位行业：</label><span>交通运输、仓储和邮政业</span></div>
+  <div class="item"><label class="label">单位规模：</label><span>10000人以上</span></div>
+</div></div>
+"""
+
+DETAIL_PAGE_FRAGMENT = """
+<html><head><title>数据开发工程师-厦门大学就业信息网</title></head><body>
+<div>需求专业：【本科】信息与计算科学,【本科】数学类 职位详情 单位介绍 工作地址</div>
+<div>7000-10000</div><div>|</div><div>福建省厦门市思明区</div>
+<div>|</div><div>全职</div><div>|</div><div>本科</div>
+<div>2026-09-03</div><div>厦门某科技有限公司</div>
+<div>单位性质：</div><div>国有企业</div>
+<div>单位行业：</div><div>制造业</div>
+<div>单位规模：</div><div>1000-5000人</div>
+</body></html>
+"""
+
+
+class TestCompanyBlock:
+    """
+    详情页底部的「单位性质 / 单位行业 / 单位规模」。
+
+    这两个字段是 P0 的补齐点：页面上一直有，解析一直没取。
+    找不到时的表现是整列为空——不会报错，所以必须有测试锁住。
+    """
+
+    @staticmethod
+    def _lines(html: str):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        return [l.strip() for l in soup.get_text("\n", strip=True).split("\n")
+                if l.strip()]
+
+    def test_structured_label_span(self):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(COMPANY_BLOCK_FRAGMENT, "lxml")
+        block = XmuCareerSpider._parse_company_block(
+            soup, self._lines(COMPANY_BLOCK_FRAGMENT))
+
+        assert block["nature"] == "国有企业"
+        assert block["industry"] == "交通运输、仓储和邮政业"
+        assert block["scale"] == "10000人以上"
+
+    def test_line_fallback_when_classes_change(self):
+        """
+        站点改版换掉 class 时，按行扫描仍要能取出值。
+
+        只留一条路（结构化选择器）的风险是：改版后整列静默变空。
+        留兜底路的收益就是这里——降级成「可能少几条」，而不是全空。
+        """
+        from bs4 import BeautifulSoup
+        lines = ["单位性质：", "国有企业", "单位行业：",
+                 "交通运输、仓储和邮政业", "单位规模：", "10000人以上"]
+        soup = BeautifulSoup("<div>页面结构变了，没有 label</div>", "lxml")
+
+        block = XmuCareerSpider._parse_company_block(soup, lines)
+        assert block["nature"] == "国有企业"
+        assert block["industry"] == "交通运输、仓储和邮政业"
+        assert block["scale"] == "10000人以上"
+
+    def test_inline_value_on_same_line(self):
+        """值写在标签同一行（'单位性质：国有企业'）也要认"""
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup("<div></div>", "lxml")
+        block = XmuCareerSpider._parse_company_block(
+            soup, ["单位性质：国有企业", "单位行业：制造业", "单位规模：少于50人"])
+
+        assert block["nature"] == "国有企业"
+        assert block["industry"] == "制造业"
+        assert block["scale"] == "少于50人"
+
+    def test_missing_block_returns_empty(self):
+        """字段确实没有时要返回空，不能瞎凑"""
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup("<div>什么都没有</div>", "lxml")
+        block = XmuCareerSpider._parse_company_block(
+            soup, ["职位详情", "单位介绍"])
+
+        assert block == {"nature": "", "industry": "", "scale": ""}
+
+    def test_not_confused_by_nav_words(self):
+        """
+        ★ 导航里的「事业单位」「单位服务」「单位问卷调查」不能被当成字段。
+
+        用 startswith 匹配 + 只认「单位性质 / 单位行业 / 单位规模」三个前缀，
+        正是为了防这一类误命中。
+        """
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup("<div></div>", "lxml")
+        block = XmuCareerSpider._parse_company_block(
+            soup, ["事业单位", "单位服务", "单位问卷调查", "单位介绍"])
+
+        assert block == {"nature": "", "industry": "", "scale": ""}
+
+    def test_parse_wires_fields_into_job(self):
+        """
+        端到端：解析器算出来的值，必须真的落到 Job 上。
+
+        「解析写好了但没接线」是本项目反复出现的失败模式——
+        函数正确、单测也过，但产出对象上字段永远是空的。
+        """
+        spider = XmuCareerSpider(fetch_detail=False)
+        jobs = spider.parse(DETAIL_PAGE_FRAGMENT,
+                            "https://jy.xmu.edu.cn/job/view/id/2401083")
+
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job.industry == "制造业"
+        assert job.company_nature == "国有企业"
+        assert job.company_scale == "1000-5000人"
+
+
+# ===================================================================
+# 7. 内嵌数据两层解码
 # ===================================================================
 def _incompressible(n: int = 600) -> str:
     """
@@ -351,7 +526,7 @@ class TestDecoder:
 
 
 # ===================================================================
-# 7. 码表完整性
+# 8. 码表完整性
 # ===================================================================
 class TestCodeTables:
     def test_required_cities(self):
