@@ -40,12 +40,19 @@ def make_job(jid: str, company: str = "", title: str = "", *,
              city: str = "福建省厦门市", salary: str = "8000-12000",
              education: str = "本科", publish_date: str = "2026-09-20",
              major: str = "数学类、信息与计算科学",
-             deadline: str = "2026-10-01", detail: bool = True) -> Job:
+             deadline: str = "2026-10-01", detail: bool = True,
+             industry: str = "制造业", company_scale: str = "10000人以上",
+             company_nature: str = "国有企业") -> Job:
     """
     造一个岗位，模拟爬虫的产出形状。
 
-    :param detail: True 表示已抓过详情页（含专业/截止时间），
+    :param detail: True 表示已抓过详情页（含专业/截止时间/单位性质），
                    False 表示这是列表页阶段的产物。
+
+    注意 industry / company_scale 无论 detail 与否都给值——
+    这两个字段来自列表页，与「抓没抓详情」无关。
+    company_nature 则只有详情页才有，detail=False 时必须为空，
+    这正是「跳过详情会丢字段」的现实来源。
     """
     job = Job(
         company=company or f"公司{jid}",
@@ -54,6 +61,9 @@ def make_job(jid: str, company: str = "", title: str = "", *,
         publish_date=publish_date,
         major_requirement=major if detail else "",
         deadline=deadline if detail else "",
+        industry=industry,
+        company_scale=company_scale,
+        company_nature=company_nature if detail else "",
         source="厦门大学就业信息网",
         url=f"https://jy.xmu.edu.cn/job/view/id/{jid}",
         source_job_id=str(jid),
@@ -123,6 +133,38 @@ class TestFingerprint:
     def test_empty_job_is_stable(self):
         assert list_fingerprint(Job()) == list_fingerprint(Job())
 
+    # ---- 单位属性：只进内容指纹，不进列表指纹（2026-09-23 新增）----
+    def test_content_fingerprint_covers_company_attributes(self):
+        """
+        行业 / 单位性质 / 单位规模 变了，内容指纹必须能感知。
+
+        这三个字段是 2026-09-23 补采的。若漏登记进内容指纹，
+        岗位改了行业就永远检测不到——不会报错，只会静默漏掉变更。
+        """
+        base = make_job("1")
+        for field, kwargs in (
+            ("industry", {"industry": "信息传输、软件和信息技术服务业"}),
+            ("company_nature", {"company_nature": "其他企业"}),
+            ("company_scale", {"company_scale": "500-1000人"}),
+        ):
+            changed = make_job("1", **kwargs)
+            assert content_fingerprint(base) != content_fingerprint(changed), \
+                f"{field} 变了，内容指纹却没变"
+
+    def test_list_fingerprint_ignores_company_attributes(self):
+        """
+        ★ 单位属性**不该**进列表指纹。
+
+        列表指纹决定「要不要重抓详情页」。industry / company_scale
+        本来就来自列表页，本次已经拿到新值了，再为它触发一次详情请求
+        纯属浪费（约 1.6 秒/条）。所以这两个字段变化必须对列表指纹免疫。
+        """
+        base = make_job("1", detail=False)
+        changed = make_job("1", detail=False,
+                           industry="信息传输、软件和信息技术服务业",
+                           company_scale="500-1000人")
+        assert list_fingerprint(base) == list_fingerprint(changed)
+
 
 class TestJobKey:
     def test_format(self):
@@ -165,6 +207,27 @@ class TestOdsSnapshots:
         orphan = Job(company="A", title="B")     # 没有 job_key
         assert ods.save_snapshots("b1", [orphan]) == 0
         assert ods.count_snapshots() == 0
+
+    def test_snapshot_stores_company_attributes(self, ods):
+        """
+        单位行业 / 单位性质 / 单位规模必须原样落进快照（2026-09-23 新增）。
+
+        只加字段名不加写库语句，是最容易漏的一步：模型上加了三列、
+        表结构也加了三列，但 INSERT 没带上，结果是「字段全空且不报错」。
+        所以这里直接断言取回来的值。
+        """
+        ods.save_snapshots("b1", [make_job("1")])
+
+        row = ods.history_of("xmu:1")[0]
+        assert row["industry"] == "制造业"
+        assert row["company_nature"] == "国有企业"
+        assert row["company_scale"] == "10000人以上"
+
+        # 状态层也要能带出来（回填靠它）
+        state = ods.latest_states()["xmu:1"]
+        assert state.company_nature == "国有企业"
+        assert state.industry == "制造业"
+        assert state.company_scale == "10000人以上"
 
     def test_latest_states_reports_latest(self, ods):
         ods.save_snapshots("b1", [make_job("1", salary="8000-12000")])
@@ -237,6 +300,63 @@ class TestBatchLedger:
         when = datetime(2026, 9, 21, 10, 52, 30)
         assert new_batch_id(when) == "20260921_105230"
 
+    # ---- 孤儿批次（2026-09-24 新增）----
+    #
+    # 背景：进程被强杀时 close_batch 根本没机会执行，批次会永远挂在
+    # running。台账里出现「永远在跑」的批次是假账——监控会误判，
+    # 人工排查时也分不清「真的在跑」还是「死了没埋」。
+
+    @staticmethod
+    def _rewind(ods, batch_id, hours):
+        """把批次的开始时间往前拨，模拟一个很久以前开、但没收尾的批次"""
+        from core.dbutil import connect
+        stamp = (datetime.now() - timedelta(hours=hours)).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        with connect(ods.db_path) as conn:
+            conn.execute(
+                "UPDATE ods_crawl_batch SET started_at = ? WHERE batch_id = ?",
+                (stamp, batch_id))
+
+    def test_fresh_running_batch_is_not_orphan(self, ods):
+        """★ 刚开始跑的批次不能被当成孤儿——否则会误伤正在执行的任务"""
+        ods.open_batch("b_now", "incremental")
+        assert ods.orphan_batches(stale_hours=6) == []
+
+    def test_stale_running_batch_is_orphan(self, ods):
+        ods.open_batch("b_old", "incremental")
+        self._rewind(ods, "b_old", hours=30)
+
+        orphans = ods.orphan_batches(stale_hours=6)
+        assert [b["batch_id"] for b in orphans] == ["b_old"]
+
+    def test_closed_batch_is_not_orphan(self, ods):
+        """已正常收尾的批次，无论放多久都不该被再动一次"""
+        ods.open_batch("b_done", "incremental")
+        ods.close_batch("b_done", status="ok", list_items=5)
+        self._rewind(ods, "b_done", hours=30)
+
+        assert ods.orphan_batches(stale_hours=6) == []
+
+    def test_close_orphan_batches_marks_failed(self, ods):
+        ods.open_batch("b1", "incremental")
+        ods.open_batch("b2", "incremental")
+        self._rewind(ods, "b1", hours=30)
+        self._rewind(ods, "b2", hours=30)
+        ods.open_batch("b_fresh", "incremental")      # 这条不该被动
+
+        closed = ods.close_orphan_batches(stale_hours=6)
+
+        assert sorted(closed) == ["b1", "b2"]
+        for bid in ("b1", "b2"):
+            b = ods.get_batch(bid)
+            assert b["status"] == "failed"
+            assert b["finished_at"], "收尾必须写上结束时间"
+            assert b["note"], "要说明为什么被标记为 failed"
+        assert ods.get_batch("b_fresh")["status"] == "running"
+
+    def test_no_orphan_returns_empty(self, ods):
+        assert ods.close_orphan_batches(stale_hours=6) == []
+
 
 # ===================================================================
 # 3. 增量判定
@@ -274,6 +394,54 @@ class TestIncrementalPlan:
         apply_backfill(plan)
         assert fresh.major_requirement == "数学类", "必须回填，否则字段被抹空"
         assert fresh.detail_fetched is False
+
+    def test_skipped_job_restores_company_fields(self, ods):
+        """
+        ★★ 本次改造最关键的一条回归：进了内容指纹的字段，必须能回填。
+
+        场景：第一次抓到详情，第二次增量跳过详情。
+        单位性质只有详情页有，跳过时它在内存里是空的。若不做还原，
+        同一条岗位会算出两个不同的内容指纹——表征是 change_count
+        每次跑都虚增、--ods-changes 里堆满假变化，而且全程不报错。
+
+        这条用例同时锁三件事：
+          ① 跳过详情的岗位能拿回单位性质
+          ② 还原后的内容指纹 == 抓过详情那条的指纹（即「不漂移」）
+          ③ 写回 ODS 后 change_count 保持 0（端到端验证，不只是对象层面）
+        """
+        full = make_job("1", detail=True)
+        ods.save_snapshots("b1", [full])
+
+        fresh = make_job("1", detail=False)          # 列表阶段：单位性质为空
+        assert fresh.company_nature == "", "前提：列表页拿不到单位性质"
+
+        plan = plan_detail_fetch([fresh], ods.latest_states(), now=self.NOW)
+        assert plan.skipped_count == 1, "内容没变就该跳过详情"
+
+        apply_backfill(plan)
+        assert fresh.company_nature == "国有企业", "单位性质必须从历史快照回填"
+        assert content_fingerprint(fresh) == content_fingerprint(full), \
+            "回填后内容指纹必须与上次一致，否则每次增量跑都虚报一次内容变化"
+
+        ods.save_snapshots("b2", [fresh])
+        assert ods.latest_states()["xmu:1"].change_count == 0, \
+            "跳过详情的第二次抓取不应被记成一次内容变更"
+
+    def test_list_derived_company_fields_are_not_overwritten_by_history(self, ods):
+        """
+        列表页本次拿到的行业/规模优先，不被历史快照的旧值盖回去。
+
+        行业的权威来源是列表页（详情页也有，但当两处不一致时，
+        以本次抓到的为准）。回填只负责补空，不负责改写。
+        """
+        ods.save_snapshots("b1", [make_job("1", industry="制造业")])
+        fresh = make_job("1", detail=False, industry="科学研究和技术服务业")
+
+        plan = plan_detail_fetch([fresh], ods.latest_states(), now=self.NOW)
+        apply_backfill(plan)
+
+        assert fresh.industry == "科学研究和技术服务业", \
+            "本次列表页已拿到新值，不该被历史值覆盖"
 
     # ---- 规则 3：列表字段有变化 ----
     def test_list_change_triggers_refetch(self, ods):
@@ -408,6 +576,23 @@ class TestStorageMigration:
         assert rows[0]["job_key"] == "xmu:2401083"
         assert rows[0]["source_job_id"] == "2401083"
 
+    def test_adds_company_attribute_columns(self, tmp_path):
+        """
+        ★ 老库必须自动补上三个单位属性列。
+
+        库里的 284 条岗位是抓 8 分钟换来的。加字段就要求清库重建，
+        等于每次改表都把资产归零——用户的实际选择会变成「不升级」。
+        所以这里锁死「自动迁移」这件事本身。
+        """
+        db = tmp_path / "old.db"
+        self._make_old_db(db)
+
+        storage = JobStorage(db_path=db)
+
+        for col in ("industry", "company_nature", "company_scale"):
+            assert col in storage.migrated_columns, f"{col} 未自动补列"
+        assert storage.count() == 1, "迁移不能丢数据"
+
     def test_migrated_row_is_recognised_as_existing(self, tmp_path):
         """
         迁移后重新抓到这个岗位，必须走「更新」而不是「新增」。
@@ -489,12 +674,53 @@ class TestStorageLifecycle:
         assert stats["inactive"] == 1
 
 
+class TestStorageCompanyAttributes:
+    """
+    单位属性在最新状态层的写入 / 更新 / 读取（2026-09-23 新增）。
+
+    这三列是 P0 补采的源字段，落库链路上有三处容易漏：
+        建表语句、MIGRATION_COLUMNS、INSERT/UPDATE 的列清单。
+    漏掉任何一处都不会报错，只会得到「字段永远为空」。
+    """
+
+    def test_insert_and_read_back(self, storage):
+        storage.save_jobs_batch("b1", [make_job("1")])
+
+        row = storage.query_jobs()[0]
+        assert row["industry"] == "制造业"
+        assert row["company_nature"] == "国有企业"
+        assert row["company_scale"] == "10000人以上"
+
+    def test_empty_value_does_not_wipe_existing(self, storage):
+        """
+        ★ 空值不能覆盖已有的值。
+
+        第二次是「跳过详情」的增量跑，company_nature 在内存里是空的
+        （历史回填也没命中时）。若 UPDATE 无条件赋值，库里的单位性质
+        就被一次「没抓到」擦掉了——而信息缺失不等于信息为空。
+        """
+        storage.save_jobs_batch("b1", [make_job("1")])
+        storage.save_jobs_batch("b2", [make_job("1", detail=False)])
+
+        row = storage.query_jobs()[0]
+        assert row["company_nature"] == "国有企业", "空值把已有的单位性质抹掉了"
+        assert row["industry"] == "制造业"
+
+    def test_load_all_jobs_restores_company_fields(self, storage):
+        """重打分走的是 load_all_jobs，字段还原不了会在写回时被抹空"""
+        storage.save_jobs_batch("b1", [make_job("1")])
+
+        job = storage.load_all_jobs()[0]
+        assert job.industry == "制造业"
+        assert job.company_nature == "国有企业"
+        assert job.company_scale == "10000人以上"
+
+
 class TestRebuildFromOds:
     """
     「ODS 是稳定数据源」的核心断言：
     ★删除最新状态层后，能只靠 ODS 把它一模一样地重建出来。
     """
-
     def test_rebuild_restores_everything(self, ods, storage):
         ods.open_batch("b1", "incremental")
         ods.save_snapshots("b1", [make_job("1"), make_job("2")])
@@ -513,6 +739,10 @@ class TestRebuildFromOds:
         assert rows["xmu:1"]["salary"] == "8000-12000"
         assert rows["xmu:1"]["major_requirement"] == "数学类、信息与计算科学"
         assert rows["xmu:1"]["first_seen_at"], "首见时间应能从 ODS 还原"
+        # 单位属性也要能重放出来，否则 --rebuild-state 会静默削掉三列数据
+        assert rows["xmu:1"]["industry"] == "制造业"
+        assert rows["xmu:1"]["company_nature"] == "国有企业"
+        assert rows["xmu:1"]["company_scale"] == "10000人以上"
 
     def test_rebuild_restores_change_count(self, ods, storage):
         """变更次数只有 ODS 知道，重建时要能还原"""

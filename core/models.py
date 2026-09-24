@@ -25,6 +25,19 @@ class Job:
     source: str = ""             # 数据来源站点
     url: str = ""                # 原文链接
 
+    # ---- 单位（雇主）属性（2026-09-23 新增）----
+    # 这三项站点两个页面都给，但**主源不同**，见 spiders/xmu_career.py：
+    #   industry / company_scale  列表页就有（.company 下的嵌套 <ul>），
+    #                             任何一次抓取都能拿到，不依赖详情页
+    #   company_nature            只有详情页有（「单位性质：国有企业」），
+    #                             增量跳过详情时必须靠回填补回来
+    # 【为什么要采它们】规划里的分析目标包含「城市 × 行业供需对比」，
+    # 而行业这个维度在数据模型里原本是**缺失**的——页面有、解析没取，
+    # 等于整个维度不可能算。补上它才是纯采集侧的改动，成本最低。
+    industry: str = ""           # 单位行业，如「交通运输、仓储和邮政业」
+    company_nature: str = ""     # 单位性质，如「国有企业」
+    company_scale: str = ""      # 单位规模，如「10000人以上」
+
     # ---- 打分阶段填充 ----
     match_score: int = 0                 # 匹配总分
     match_level: str = ""                # 匹配等级 S/A/B/C
@@ -74,12 +87,27 @@ class Job:
 # 两个混用都会出问题：拿内容指纹做增量判定，详情字段一空就被判成
 # 「变了」，每次都会全量重抓；拿列表指纹做变更检测，则详情页的专业
 # 要求改了也检测不到。
+#
+# 【单位属性为什么只进内容指纹、不进列表指纹】（2026-09-23 新增）
+#   industry / company_scale 是从列表页解析的，看上去该进列表指纹。
+#   但列表指纹的用途是「决定要不要重抓详情页」——而这两个字段本身
+#   就来自列表页，新值本次已经拿到了，再为它触发一次详情请求纯属浪费。
+#   所以只在内容指纹里登记：行业/规模真的变了，能被变更检测发现
+#   （change_count +1、--ods-changes 看得到），但不会引发多余的网络请求。
+#
+#   ⚠️ 由此产生一条**必须遵守的约束**：
+#   进了内容指纹的字段，必须在「跳过详情」的链路上也能被还原。
+#   否则同一条岗位，抓了详情时算出指纹 A、跳过详情时算出指纹 B，
+#   每次增量跑都会被误判成「内容有变化」，change_count 一路虚增。
+#   这就是 company_nature 必须纳入回填表的原因——它只有详情页有。
+#   （回填机制见 core/incremental.py 的 DetailFields / apply_backfill）
 
 LIST_FINGERPRINT_FIELDS = (
     "company", "title", "city", "salary", "education", "publish_date",
 )
 CONTENT_FINGERPRINT_FIELDS = LIST_FINGERPRINT_FIELDS + (
     "major_requirement", "deadline",
+    "industry", "company_nature", "company_scale",
 )
 
 

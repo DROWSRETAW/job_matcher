@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from config import DB_PATH, ODS_SOURCE_KEY
+from config import DB_PATH, ODS_SOURCE_KEY, ORPHAN_BATCH_HOURS
 from core.dbutil import connect, ensure_columns
 from core.models import Job, list_fingerprint, content_fingerprint
 
@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS ods_job_snapshot (
     deadline          TEXT,
     publish_date      TEXT,
     url               TEXT,
+    -- ---- 单位属性（2026-09-23 新增，站点原样值，不做归一化）----
+    -- 归一化属于 DWD 的职责，ODS 只如实记录页面怎么写的
+    industry          TEXT,
+    company_nature    TEXT,
+    company_scale     TEXT,
     -- ---- 指纹与状态标记 ----
     list_hash         TEXT NOT NULL,
     content_hash      TEXT NOT NULL,
@@ -128,6 +133,9 @@ SNAPSHOT_MIGRATION_COLUMNS = {
     "list_hash": "TEXT",
     "content_hash": "TEXT",
     "detail_fetched": "INTEGER NOT NULL DEFAULT 0",
+    "industry": "TEXT",
+    "company_nature": "TEXT",
+    "company_scale": "TEXT",
 }
 
 
@@ -156,6 +164,12 @@ class JobState:
     detail_at: str = ""            # 最近一次真正抓到详情的时刻（"" = 从未）
     major_requirement: str = ""    # 来自 detail_at 那条快照
     deadline: str = ""
+    # 单位属性同理，来自 detail_at 那条快照：
+    # company_nature 只有详情页有，是这三项里真正会被用到的回填来源；
+    # industry / company_scale 列表页本来就有，这里是列表页偶发缺值时的兜底。
+    industry: str = ""
+    company_nature: str = ""
+    company_scale: str = ""
     change_count: int = 0          # 历史上内容指纹发生变化的次数
 
     @property
@@ -272,6 +286,59 @@ class OdsRepository:
             )
         return batch_id
 
+    def orphan_batches(self, stale_hours: float = ORPHAN_BATCH_HOURS) -> List[dict]:
+        """
+        找出「挂着 running 但其实早就死了」的批次。
+
+        为什么需要：进程被强杀（工具超时、断网、直接关窗口）时，
+        close_batch 根本没机会执行，批次就永远停在 running。
+        ODS 台账里出现「永远在跑」的批次是一种假账——监控会误判，
+        人工排查时也分不清「真的在跑」还是「死了没埋」。
+
+        :param stale_hours: 只认开始时间早于这么久之前的批次，
+                            避免误伤正在进行中的任务
+        """
+        if stale_hours is None or stale_hours < 0:
+            stale_hours = ORPHAN_BATCH_HOURS
+        cutoff = (datetime.now() - timedelta(hours=stale_hours)) \
+            .strftime("%Y-%m-%d %H:%M:%S")
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ods_crawl_batch
+                 WHERE status = 'running'
+                   AND finished_at IS NULL
+                   AND (started_at IS NULL OR started_at < ?)
+                 ORDER BY started_at
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def close_orphan_batches(self, stale_hours: float = ORPHAN_BATCH_HOURS,
+                             note: str = "") -> List[str]:
+        """
+        把孤儿批次收尾为 failed。
+
+        :return: 被收尾的批次号列表
+        """
+        orphans = self.orphan_batches(stale_hours)
+        if not orphans:
+            return []
+
+        note = note or f"进程被外部中断，未正常收尾（于 {datetime.now():%Y-%m-%d %H:%M} 补记）"
+        closed = []
+        with connect(self.db_path) as conn:
+            for b in orphans:
+                conn.execute(
+                    "UPDATE ods_crawl_batch SET status = 'failed', "
+                    "finished_at = ?, note = ? WHERE batch_id = ?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note,
+                     b["batch_id"]),
+                )
+                closed.append(b["batch_id"])
+        return closed
+
     def close_batch(self, batch_id: str, status: str = "ok",
                     note: str = "", **counters) -> None:
         """
@@ -352,8 +419,10 @@ class OdsRepository:
                         (job_key, source, source_job_id, batch_id, crawled_at,
                          company, title, city, salary, education,
                          major_requirement, apply_method, deadline, publish_date,
-                         url, list_hash, content_hash, detail_fetched)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         url, industry, company_nature, company_scale,
+                         list_hash, content_hash, detail_fetched)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -364,7 +433,8 @@ class OdsRepository:
                         job.company, job.title, job.city, job.salary,
                         job.education, job.major_requirement,
                         job.apply_method, job.deadline, job.publish_date,
-                        job.url,
+                        job.url, job.industry, job.company_nature,
+                        job.company_scale,
                         list_fingerprint(job),
                         content_fingerprint(job),
                         1 if job.detail_fetched else 0,
@@ -411,6 +481,9 @@ class OdsRepository:
                 detail_at=(detail["crawled_at"] if detail else ""),
                 major_requirement=((detail["major_requirement"] if detail else "") or ""),
                 deadline=((detail["deadline"] if detail else "") or ""),
+                industry=((detail["industry"] if detail else "") or ""),
+                company_nature=((detail["company_nature"] if detail else "") or ""),
+                company_scale=((detail["company_scale"] if detail else "") or ""),
                 change_count=changes.get(key, 0),
             )
         return states

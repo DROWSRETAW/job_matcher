@@ -146,6 +146,7 @@ from config import (
     SEARCH_MAX_PAGES,
     CITY_CODES, EDUCATION_CODES, CATEGORY_CODES, TIME_CODES,
     NATURE_CODES, SCALE_CODES, MAJOR_CODES, DEFAULT_MAJOR_KEYS,
+    DETAIL_MAX_CONSECUTIVE_FAILURES,
 )
 from core.decoder import decode_embedded_html, probe_encoding
 from core.models import Job, make_job_key, list_fingerprint
@@ -332,6 +333,8 @@ class XmuCareerSpider(BaseSpider):
             # ---- 增量相关（2026-09-21 新增）----
             "detail_skipped": 0,     # 因增量判定而省下的详情请求数
             "backfilled": 0,         # 用历史快照回填了专业字段的岗位数
+            # ---- 止损相关（2026-09-23 新增）----
+            "detail_aborted": 0,     # 因连续失败而放弃抓取的详情条数
         }
 
     # -----------------------------------------------------------------
@@ -514,6 +517,19 @@ class XmuCareerSpider(BaseSpider):
             city = meta[0] if len(meta) > 0 else ""
             education = meta[2] if len(meta) > 2 else ""
 
+            # 公司名下方还有一个嵌套 <ul>：单位行业 / 单位规模
+            # （2026-09-23 补。此前只取了 .salary 那个 ul，
+            #   行业与规模被静默丢弃，导致「城市 × 行业」这个分析维度
+            #   在设计上就不可能成立）
+            # 注意用 `.company > div > ul` 限定在 company 块内，
+            # 不要写 li.select("ul") 之类的宽匹配——列表项里有两个 ul。
+            company_meta = []
+            cm_ul = li.select_one(".company > div > ul") or li.select_one(".company ul")
+            if cm_ul:
+                company_meta = [x.get_text(strip=True) for x in cm_ul.find_all("li")]
+            industry = company_meta[0] if len(company_meta) > 0 else ""
+            company_scale = company_meta[1] if len(company_meta) > 1 else ""
+
             pub = li.select_one(".name span")
             publish_date = pub.get_text(strip=True) if pub else ""
 
@@ -528,6 +544,10 @@ class XmuCareerSpider(BaseSpider):
                 major_requirement="",     # ★ 列表页没有，由详情页补
                 deadline="",              # 同理；抓不到详情时用发布日期兜底
                 publish_date=publish_date,  # 独立记录发布日期，供增量判定
+                industry=industry,        # 列表页有，不依赖详情页
+                company_scale=company_scale,
+                # company_nature 列表页没有（那里的「全职」是工作性质，
+                # 不是单位性质），只能等详情页
                 apply_method=url,
                 source="厦门大学就业信息网",
                 url=url,
@@ -605,12 +625,17 @@ class XmuCareerSpider(BaseSpider):
         if failed:
             rescued = 0
             for job in failed:
-                major, deadline = plan.backfill.get(job.job_key, ("", ""))
-                if major:
-                    job.major_requirement = major
+                recovery = plan.backfill.get(job.job_key)
+                if recovery is None:
+                    continue
+                # 与 apply_backfill 同一套语义：只补空值。
+                # 抓失败的岗位，这些字段在内存里本来就是空的，
+                # 不补的话一次网络抖动就把库里的值抹成空串。
+                for name, value in recovery.as_items():
+                    if value and not getattr(job, name, ""):
+                        setattr(job, name, value)
+                if job.major_requirement:
                     rescued += 1
-                if deadline and not job.deadline:
-                    job.deadline = deadline
             self.logger.warning(
                 "%d 条详情抓取失败（成功 %d 条），已用历史快照兜住 %d 条的专业字段；"
                 "失败的下次运行会重试",
@@ -620,8 +645,15 @@ class XmuCareerSpider(BaseSpider):
         """
         逐条抓详情页并回填（enrich_majors 与 enrich_by_plan 共用的循环体）。
 
-        只回填「需求专业」和「截止时间」——公司名/岗位名保持列表页的值，
+        只回填详情页才有的字段——公司名/岗位名保持列表页的值，
         因为它们参与数据库的去重判断，改写可能让同一岗位重复入库。
+
+        单位属性按来源分两类（2026-09-23）：
+            company_nature          只有详情页有 → 直接取详情值
+            industry / company_scale 列表页也有 → 本次列表值优先，
+                                     详情值只在列表页没给时兜底。
+                                     反过来的话，同一条岗位会因为「抓没抓详情」
+                                     而算出不同的内容指纹，变更统计会虚增。
         """
         if not target:
             return
@@ -630,6 +662,8 @@ class XmuCareerSpider(BaseSpider):
                          "预计约 %.1f 分钟",
                          len(target), len(target) * self.detail_delay / 60)
 
+        consecutive_failures = 0
+
         for i, job in enumerate(target, 1):
             jid = self._jid_of(job.url)
             if not jid:
@@ -637,19 +671,41 @@ class XmuCareerSpider(BaseSpider):
 
             detail = self._fetch_job_page(jid)
             if detail:
+                consecutive_failures = 0
                 job.major_requirement = detail.major_requirement or ""
                 if detail.deadline:
                     job.deadline = detail.deadline
+                if detail.company_nature:
+                    job.company_nature = detail.company_nature
+                if detail.industry and not job.industry:
+                    job.industry = detail.industry
+                if detail.company_scale and not job.company_scale:
+                    job.company_scale = detail.company_scale
                 # 页面成功解析即算「这次真抓到了详情」。
                 # 若页面本身没写专业要求（parse 会返回空列表），
                 # detail_fetched 仍为 False，下次会再试一次。
                 job.detail_fetched = True
                 if job.major_requirement:
                     self.stats["detail_major_found"] += 1
+            else:
+                # 连续失败计数：偶发失败（个别岗位 404）靠增量下次重试即可，
+                # 但连着失败说明整站不可用，继续只会把时间烧在必失败的请求上。
+                consecutive_failures += 1
 
             if i % 20 == 0 or i == len(target):
                 self.logger.info("  详情进度 %d/%d（已取到专业 %d 条）",
                                  i, len(target), self.stats["detail_major_found"])
+
+            if (DETAIL_MAX_CONSECUTIVE_FAILURES
+                    and consecutive_failures >= DETAIL_MAX_CONSECUTIVE_FAILURES):
+                remaining = len(target) - i
+                self.stats["detail_aborted"] = remaining
+                self.logger.error(
+                    "连续 %d 条详情请求失败，判定为目标站点不可用，"
+                    "提前中止剩余 %d 条抓取。已抓到的数据会正常落库，"
+                    "未抓的部分下次运行增量补上。",
+                    consecutive_failures, remaining)
+                break
 
             if i < len(target):
                 time.sleep(self.detail_delay)
@@ -720,7 +776,9 @@ class XmuCareerSpider(BaseSpider):
             {公司名}
             单位性质：{...}
             单位行业：{...}
+            单位规模：{...}
         """
+
         soup = BeautifulSoup(html, "lxml")
 
         # 导航栏目文本（用于剔除干扰）
@@ -761,6 +819,7 @@ class XmuCareerSpider(BaseSpider):
             return []
 
         meta = self._parse_meta_block(lines)
+        company_block = self._parse_company_block(soup, lines)
 
         job = Job(
             title=title,
@@ -770,6 +829,9 @@ class XmuCareerSpider(BaseSpider):
             major_requirement=majors,
             company=self._parse_company(soup, lines),
             deadline=self._parse_deadline(soup) or meta["publish_date"],
+            industry=company_block["industry"],
+            company_nature=company_block["nature"],
+            company_scale=company_block["scale"],
             apply_method=url,
             source="厦门大学就业信息网",
             url=url,
@@ -910,6 +972,69 @@ class XmuCareerSpider(BaseSpider):
                         return cand
                 break
         return ""
+
+    # -----------------------------------------------------------------
+    # 单位属性解析（2026-09-23 新增）
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _parse_company_block(soup: BeautifulSoup, lines: List[str]) -> dict:
+        """
+        解析详情页底部的公司信息块：单位性质 / 单位行业 / 单位规模。
+
+        :return: {"nature": 单位性质, "industry": 单位行业, "scale": 单位规模}
+
+        实测到的真实结构（2026-09-23 对 jy.xmu.edu.cn 抓取确认）：
+            <div class="info"><div style="padding-top: 15px;">
+              <div class="item"><label class="label">单位性质：</label><span>国有企业</span></div>
+              <div class="item"><label class="label">单位行业：</label><span>交通运输、仓储和邮政业</span></div>
+              <div class="item"><label class="label">单位规模：</label><span>10000人以上</span></div>
+            </div></div>
+
+        文本层面则是「标签独占一行、值占下一行」：
+            86 | '单位性质：'
+            87 | '国有企业'
+            88 | '单位行业：'
+            89 | '交通运输、仓储和邮政业'
+            90 | '单位规模：'
+            91 | '10000人以上'
+
+        两路解析的理由与 _parse_company 一致：结构化选择器最准，
+        但站点改版换掉 class 时它会静默返回空。留一条按行扫描的兜底，
+        改版后字段降级为「可能少几条」，而不是整列全空。
+
+        注意：这里**不做归一化**。ODS 只记录页面怎么写，
+        「国有企业 / 国企 / 中央企业」这类归一属于 DWD 的活。
+        """
+        result = {"nature": "", "industry": "", "scale": ""}
+        labels = {"单位性质": "nature", "单位行业": "industry", "单位规模": "scale"}
+
+        # ---- 路 1：结构化 <label> + 相邻 <span> ----
+        for label in soup.find_all("label"):
+            key = labels.get(label.get_text(strip=True).rstrip("：:").strip())
+            if not key or result[key]:
+                continue
+            node = label.find_next_sibling("span")
+            if node:
+                result[key] = node.get_text(strip=True)
+
+        # ---- 路 2：按行扫描（标签行 + 下一行是值）----
+        for i, line in enumerate(lines):
+            for prefix, key in labels.items():
+                if result[key]:
+                    continue
+                if not line.startswith(prefix):
+                    continue
+                # 同一行的形式：'单位性质：国有企业'
+                inline = line[len(prefix):].lstrip("：:").strip()
+                if inline:
+                    result[key] = inline
+                    continue
+                # 下一行的形式（站点实际就是这个）
+                nxt = lines[i + 1] if i + 1 < len(lines) else ""
+                if nxt and not nxt.endswith("："):
+                    result[key] = nxt
+
+        return result
 
     @staticmethod
     def _parse_deadline(soup: BeautifulSoup) -> str:
