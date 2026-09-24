@@ -102,10 +102,13 @@ from core.ods import OdsRepository, new_batch_id  # noqa: E402
 from core.incremental import (  # noqa: E402
     plan_detail_fetch, summarize_plan, REASON_NEW, REASON_CHANGED,
 )
+from core.dwd import DwdRepository  # noqa: E402
 from core.matcher import JobMatcher  # noqa: E402
 from core.filters import JobFilter  # noqa: E402
 from core.exporter import ExcelExporter  # noqa: E402
-from spiders.xmu_career import XmuCareerSpider, SearchProfile  # noqa: E402
+from spiders.xmu_career import (  # noqa: E402
+    XmuCareerSpider, SearchProfile, profile_scope, describe_scope,
+)
 
 
 EXAMPLES = """\
@@ -291,7 +294,24 @@ def print_banner(profile: SearchProfile, skip_crawl: bool,
     print("=" * 62)
 
 
-def _can_judge_missing(profile: SearchProfile, spider) -> tuple:
+def _last_ok_scope(ods):
+    """
+    上一批「成功批次」的检索口径；没有可比对象时返回 None。
+
+    只看 status='ok' 的批次：失败批次可能连列表页都没抓完，
+    它记下的口径不足以代表库里数据的来源。当前这一批此刻还是
+    running（close_batch 在这之后才执行），所以天然不会被选中。
+    """
+    for batch in ods.recent_batches(limit=20):
+        if batch.get("status") != "ok":
+            continue
+        scope = profile_scope(batch.get("profile_json") or "")
+        if scope:
+            return scope
+    return None
+
+
+def _can_judge_missing(profile: SearchProfile, spider, ods) -> tuple:
     """
     判断本批「列表里没再出现的岗位」能否认定为已下架。
 
@@ -301,11 +321,21 @@ def _can_judge_missing(profile: SearchProfile, spider) -> tuple:
         「这次列表里没有它」不等于「它下架了」。
         若检索条件是「近1周」，一周前发布的岗位本来就不会出现，
         但它们完全可能还在招。
-        只有同时满足下面两条，「没出现」才等价于「下架」：
+        只有同时满足下面三条，「没出现」才等价于「下架」：
             1. 检索时间范围不限 —— 否则结果本身就是按时间截断的
             2. 翻页没有触顶     —— 否则可能只是没翻完
+            3. 检索口径与建库口径一致 —— 否则"少掉的那些"根本没被问过
         不满足时只记录「本批未出现」，不碰在架状态。
         宁可漏判也不错杀：错的在架状态会让人以为岗位没了而放弃投递。
+
+    【第 3 条为什么必须加】（2026-09-24 实测踩到）
+        前两条成立、口径却不一致时，这套判定会**静默地把大半个库标死**：
+        用默认的三专业口径跑了一次，列表从 294 条掉到 24 条，
+        270 个岗位被记为「本批未再出现」，其中 266 条真被标成了下架。
+        全程没有任何报错——因为从程序的角度看，两条前提都成立。
+        而 README 里推荐的首跑命令 `python main.py --city 厦门` 用的
+        正是这个更窄的默认口径，也就是说这个坑是随时会踩的。
+        做法是拿本批口径去和上一批成功批次比对，不一致就只记录不判定。
     """
     if profile.time_range not in ("不限", "", "0", None):
         return False, f"检索条件限定为「{profile.time_range}」，老岗位不出现属正常"
@@ -314,6 +344,14 @@ def _can_judge_missing(profile: SearchProfile, spider) -> tuple:
     total_pages = spider.stats.get("total_pages") or 1
     if total_pages >= max_pages:
         return False, f"翻页达到上限 {max_pages} 页，列表可能被截断"
+
+    prev = _last_ok_scope(ods)
+    if prev is None:
+        return False, "库里没有可比较的历史检索口径，无法确认口径一致"
+    current = profile_scope(profile)
+    if prev != current:
+        return False, (f"本批检索口径与上一批不同 —— 本批[{describe_scope(profile)}] "
+                       f"/ 上批[{describe_scope(prev)}]")
 
     return True, ""
 
@@ -446,7 +484,7 @@ def run_pipeline(job_filter: JobFilter, profile: SearchProfile,
 
         # ---------- 失效判定 ----------
         if plan and plan.missing_keys:
-            can_judge, why = _can_judge_missing(profile, spider)
+            can_judge, why = _can_judge_missing(profile, spider, ods)
             if MARK_MISSING_INACTIVE and can_judge:
                 marked = storage.mark_missing_inactive(batch_id, plan.missing_keys)
                 print(f"      {len(plan.missing_keys)} 条历史岗位本批未再出现，"
@@ -709,6 +747,100 @@ def show_ods_changes(days: int = 7):
           "用 --ods-history <职位ID>。")
 
 
+def build_dwd():
+    """
+    从 ODS 重建 DWD 清洗层（不联网）。
+
+    DWD 是纯派生层：薪资数值区间、城市三级、学历枚举、经验年限、技能标签
+    全部由 ODS 的原始文本推导得出。所以清洗规则改了直接重跑这里即可，
+    秒级完成，不需要重新抓数据，也不会动 ODS 一个字节。
+    """
+    ods = OdsRepository()
+    if ods.count_jobs() == 0:
+        print("ODS 贴源层为空，无法构建 DWD。先跑一次抓取：run.bat")
+        return
+
+    dwd = DwdRepository()
+    print("=" * 62)
+    print("  构建 DWD 明细层（只读 ODS，不联网）")
+    print(f"  数据源：{ods.count_jobs()} 个岗位 / {ods.count_snapshots()} 条快照")
+    print("=" * 62)
+
+    stats = dwd.build()
+
+    print(f"\n  dwd_job_detail：{stats['jobs']} 行")
+    print(f"    薪资解析成功  ：{stats['salary_parsed']} 条"
+          f"（{stats['salary_parsed_rate']}%）")
+    print(f"    学历归一成功  ：{stats['education_level']} 条"
+          f"（{stats.get('education_level_rate', 0)}%）")
+    print(f"    城市拆出市级  ：{stats.get('city_name', 0)} 条")
+    print(f"    城市拆出区县  ：{stats['city_district']} 条"
+          f"（{stats['city_district_rate']}%）")
+    print(f"    经验有站点值  ：{stats['experience_known']} 条"
+          f"（{stats.get('experience_known_rate', 0)}%）")
+
+    print(f"\n  dwd_job_skill：{stats['skills']} 行 / "
+          f"{stats['distinct_skills']} 个去重技能")
+    print(f"    平均每岗位标签数：{stats['avg_skills']}")
+    print(f"    抽到标签的岗位  ：{stats['jobs_with_skill']} 个"
+          f"（{stats['jobs_without_skill']} 个零标签）")
+
+    print("\n  提示：技能热度榜用 --dwd-stats 查看；"
+          "清洗规则改在 core/dwd.py，改完重跑本命令即可。")
+
+
+def show_dwd_stats(top: int = 15):
+    """查看 DWD 清洗层的质量与分布"""
+    dwd = DwdRepository()
+    total = dwd.count_details()
+
+    if total == 0:
+        print("DWD 明细层为空。先构建：python main.py --build-dwd")
+        return
+
+    stats = dwd.summarize()
+
+    print("=" * 68)
+    print("  DWD 明细层（由 ODS 清洗而来，可随时重算）")
+    print("=" * 68)
+    print(f"  明细行数      ：{stats['jobs']}")
+    print(f"  薪资解析成功  ：{stats['salary_parsed']}（{stats['salary_parsed_rate']}%）")
+    print(f"  学历归一成功  ：{stats['education_level']}"
+          f"（{stats.get('education_level_rate', 0)}%）")
+    print(f"  城市拆出区县  ：{stats['city_district']}"
+          f"（{stats['city_district_rate']}%）")
+    print(f"  经验有站点值  ：{stats['experience_known']}"
+          f"（{stats.get('experience_known_rate', 0)}%）")
+    print(f"  技能标签      ：{stats['skills']} 行 / "
+          f"{stats['distinct_skills']} 个去重技能"
+          f"（均值 {stats['avg_skills']}/岗位）")
+
+    rows = dwd.salary_by_city(limit=8)
+    if rows:
+        print(f"\n  按城市看薪资（前 {len(rows)} 个城市，单位：元/月）：")
+        header = (_disp_pad("城市", 12, "left") + _disp_pad("岗位数", 8)
+                  + _disp_pad("平均月薪", 10) + _disp_pad("最低", 8)
+                  + _disp_pad("最高", 8))
+        print("    " + header)
+        for r in rows:
+            print("    " + _disp_pad(r["city_name"] or "未知", 12, "left")
+                  + _disp_pad(r["job_count"], 8)
+                  + _disp_pad(int(r["avg_salary"] or 0), 10)
+                  + _disp_pad(r["min_salary"] or 0, 8)
+                  + _disp_pad(r["max_salary"] or 0, 8))
+
+    top_rows = dwd.top_skills(limit=top)
+    if top_rows:
+        print(f"\n  技能热度 TOP{len(top_rows)}（按要求该技能的岗位数）：")
+        header = (_disp_pad("技能", 22, "left") + _disp_pad("类别", 12, "left")
+                  + _disp_pad("岗位数", 8))
+        print("    " + header)
+        for r in top_rows:
+            print("    " + _disp_pad(r["skill_name"], 22, "left")
+                  + _disp_pad(r["skill_category"], 12, "left")
+                  + _disp_pad(r["job_count"], 8))
+
+
 def rebuild_state():
     """
     从 ODS 重放历史，重建最新状态层（不联网）。
@@ -839,6 +971,15 @@ def build_parser():
     mode.add_argument(
         "--rebuild-state", action="store_true",
         help="从 ODS 重放历史重建最新状态层（不联网、不消耗站点请求）"
+    )
+    mode.add_argument(
+        "--build-dwd", action="store_true",
+        help="从 ODS 重算 DWD 明细层（薪资/城市/学历/经验清洗 + 技能标签抽取），"
+             "不联网、不消耗站点请求，可反复重跑"
+    )
+    mode.add_argument(
+        "--dwd-stats", action="store_true",
+        help="查看 DWD 明细层的构建结果（字段填充率、薪资解析率、技能标签榜）"
     )
     mode.add_argument(
         "--close-orphan-batches", action="store_true",
@@ -994,6 +1135,14 @@ def main():
 
     if args.rebuild_state:
         rebuild_state()
+        return 0
+
+    if args.build_dwd:
+        build_dwd()
+        return 0
+
+    if args.dwd_stats:
+        show_dwd_stats()
         return 0
 
     if args.rescore:

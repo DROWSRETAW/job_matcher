@@ -64,6 +64,7 @@ from config import (
     INCREMENTAL_ENABLED,
     DETAIL_REFRESH_TTL_DAYS,
     DETAIL_REFRESH_ON_LIST_CHANGE,
+    DETAIL_SCHEMA_VERSION,
 )
 from core.models import Job, list_fingerprint
 from core.ods import JobState
@@ -73,6 +74,7 @@ from core.ods import JobState
 REASON_NEW = "new"                  # 新岗位
 REASON_CHANGED = "changed"          # 列表字段有变化
 REASON_NO_DETAIL = "no_detail"      # 从未抓到过详情
+REASON_OUTDATED = "outdated"        # 详情快照由旧版解析器产生，缺新字段
 REASON_STALE = "stale"              # 详情数据超过 TTL
 REASON_UNCHANGED = "unchanged"      # 无需重抓
 REASON_FORCED = "forced"            # 增量关闭，全量抓
@@ -96,6 +98,8 @@ class BackfillFields:
     【各字段的来源，以及它到底会不会缺】
         major_requirement / deadline   只有详情页有 → 跳过详情必缺
         company_nature                 只有详情页有 → 跳过详情必缺
+        下列五项（2026-09-24 新增）     只有详情页有 → 跳过详情必缺
+            experience / job_category / language_req / headcount / city_detail
         industry / company_scale       列表页就有，正常不会缺；留着是为了
                                        列表页偶发缺值时也有历史兜底
     """
@@ -104,6 +108,11 @@ class BackfillFields:
     company_nature: str = ""
     industry: str = ""
     company_scale: str = ""
+    experience: str = ""
+    job_category: str = ""
+    language_req: str = ""
+    headcount: str = ""
+    city_detail: str = ""
 
     def as_items(self):
         """(字段名, 值) 序列，供回填循环按名字赋值"""
@@ -113,6 +122,11 @@ class BackfillFields:
             ("company_nature", self.company_nature),
             ("industry", self.industry),
             ("company_scale", self.company_scale),
+            ("experience", self.experience),
+            ("job_category", self.job_category),
+            ("language_req", self.language_req),
+            ("headcount", self.headcount),
+            ("city_detail", self.city_detail),
         )
 
 
@@ -168,6 +182,7 @@ def plan_detail_fetch(
     enabled: bool = None,
     ttl_days: int = None,
     refresh_on_change: bool = None,
+    schema_version: int = None,
     now: Optional[datetime] = None,
 ) -> DetailPlan:
     """
@@ -178,6 +193,8 @@ def plan_detail_fetch(
     :param enabled:   是否启用增量；None 用 config 默认值
     :param ttl_days:  详情数据可信天数；None 用 config 默认值
     :param refresh_on_change: 列表变化是否触发重抓；None 用 config 默认值
+    :param schema_version: 当前详情解析器版本；低于它的快照会被排进重抓队列。
+                           None 用 config.DETAIL_SCHEMA_VERSION
     :param now:       当前时间（测试注入点）
     :return: DetailPlan
     """
@@ -187,6 +204,8 @@ def plan_detail_fetch(
         ttl_days = DETAIL_REFRESH_TTL_DAYS
     if refresh_on_change is None:
         refresh_on_change = DETAIL_REFRESH_ON_LIST_CHANGE
+    if schema_version is None:
+        schema_version = DETAIL_SCHEMA_VERSION
     now = now or datetime.now()
 
     plan = DetailPlan(known_count=len(states))
@@ -221,6 +240,11 @@ def plan_detail_fetch(
                 company_nature=state.company_nature,
                 industry=state.industry,
                 company_scale=state.company_scale,
+                experience=state.experience,
+                job_category=state.job_category,
+                language_req=state.language_req,
+                headcount=state.headcount,
+                city_detail=state.city_detail,
             )
 
         # ---- 规则 1：增量关闭 ----
@@ -244,6 +268,16 @@ def plan_detail_fetch(
         # ---- 规则 4：历史上从未抓到过详情 ----
         if not state.has_detail:
             plan.reasons[key] = REASON_NO_DETAIL
+            plan.to_fetch.append(job)
+            continue
+
+        # ---- 规则 4b：详情快照由旧版解析器产生，缺新字段 ----
+        # 为什么不能靠"哪个字段为空就重抓"：某些字段在站点上本来就可能为空
+        # （比如页面没写语言要求），按空值判断会让这些岗位每轮都被重抓，
+        # 永远收敛不了。改成比对解析器版本号，判定是确定性的。
+        # 详见 config.DETAIL_SCHEMA_VERSION。
+        if (state.detail_schema_version or 0) < schema_version:
+            plan.reasons[key] = REASON_OUTDATED
             plan.to_fetch.append(job)
             continue
 
@@ -311,6 +345,7 @@ def summarize_plan(plan: DetailPlan) -> List[str]:
         (REASON_NEW, "新岗位"),
         (REASON_CHANGED, "信息有变"),
         (REASON_NO_DETAIL, "缺专业字段"),
+        (REASON_OUTDATED, "补新增字段"),
         (REASON_STALE, "超期刷新"),
         (REASON_UNCHANGED, "无需重抓"),
         (REASON_FORCED, "强制全量"),

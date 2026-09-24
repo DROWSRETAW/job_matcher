@@ -91,10 +91,23 @@ CREATE TABLE IF NOT EXISTS ods_job_snapshot (
     industry          TEXT,
     company_nature    TEXT,
     company_scale     TEXT,
+    -- ---- 岗位属性（2026-09-24 新增，同样站点原样值）----
+    -- 这几项只有详情页有。city_detail 单列而不合并进 city：
+    -- city 参与列表指纹，用它承载详情页的值会让增量误判（见 core/models.py）。
+    experience        TEXT,
+    job_category      TEXT,
+    language_req      TEXT,
+    headcount         TEXT,
+    city_detail       TEXT,
     -- ---- 指纹与状态标记 ----
     list_hash         TEXT NOT NULL,
     content_hash      TEXT NOT NULL,
     detail_fetched    INTEGER NOT NULL DEFAULT 0,   -- 本条是否真抓了详情页
+    -- 本条快照由哪一版详情解析器产生（0 = 未抓详情）。
+    -- 它是血缘标记而不是内容，**不进任何指纹**。
+    -- 用途：解析器学会新字段后，凭它把老快照排进重抓队列
+    -- （见 config.DETAIL_SCHEMA_VERSION）。
+    detail_schema_version INTEGER NOT NULL DEFAULT 0,
     -- 同一批次同一岗位只需留一条快照
     UNIQUE(job_key, batch_id)
 );
@@ -136,6 +149,13 @@ SNAPSHOT_MIGRATION_COLUMNS = {
     "industry": "TEXT",
     "company_nature": "TEXT",
     "company_scale": "TEXT",
+    # 岗位属性（2026-09-24 新增）
+    "experience": "TEXT",
+    "job_category": "TEXT",
+    "language_req": "TEXT",
+    "headcount": "TEXT",
+    "city_detail": "TEXT",
+    "detail_schema_version": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -171,6 +191,15 @@ class JobState:
     company_nature: str = ""
     company_scale: str = ""
     change_count: int = 0          # 历史上内容指纹发生变化的次数
+    # 该岗位最近一次详情快照由哪一版解析器产生（0 = 从未抓到过详情内容）。
+    # 增量据此判断"老快照该不该补字段"，见 config.DETAIL_SCHEMA_VERSION。
+    detail_schema_version: int = 0
+    # 岗位属性（2026-09-24 新增），同样来自 detail_at 那条快照
+    experience: str = ""
+    job_category: str = ""
+    language_req: str = ""
+    headcount: str = ""
+    city_detail: str = ""
 
     @property
     def has_detail(self) -> bool:
@@ -420,9 +449,13 @@ class OdsRepository:
                          company, title, city, salary, education,
                          major_requirement, apply_method, deadline, publish_date,
                          url, industry, company_nature, company_scale,
-                         list_hash, content_hash, detail_fetched)
+                         experience, job_category, language_req, headcount,
+                         city_detail,
+                         list_hash, content_hash, detail_fetched,
+                         detail_schema_version)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?)
+                            ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -435,9 +468,12 @@ class OdsRepository:
                         job.apply_method, job.deadline, job.publish_date,
                         job.url, job.industry, job.company_nature,
                         job.company_scale,
+                        job.experience, job.job_category, job.language_req,
+                        job.headcount, job.city_detail,
                         list_fingerprint(job),
                         content_fingerprint(job),
                         1 if job.detail_fetched else 0,
+                        int(job.detail_schema_version or 0),
                     ),
                 )
                 inserted += conn.execute("SELECT changes()").fetchone()[0]
@@ -484,6 +520,14 @@ class OdsRepository:
                 industry=((detail["industry"] if detail else "") or ""),
                 company_nature=((detail["company_nature"] if detail else "") or ""),
                 company_scale=((detail["company_scale"] if detail else "") or ""),
+                detail_schema_version=(
+                    (detail["detail_schema_version"] if detail else 0) or 0
+                ),
+                experience=((detail["experience"] if detail else "") or ""),
+                job_category=((detail["job_category"] if detail else "") or ""),
+                language_req=((detail["language_req"] if detail else "") or ""),
+                headcount=((detail["headcount"] if detail else "") or ""),
+                city_detail=((detail["city_detail"] if detail else "") or ""),
                 change_count=changes.get(key, 0),
             )
         return states
@@ -536,6 +580,63 @@ class OdsRepository:
         return [dict(r) for r in rows]
 
     # ===============================================================
+    # 读快照 —— DWD 的输入
+    # ===============================================================
+    def build_source_rows(self) -> List[dict]:
+        """
+        给 DWD 清洗层准备输入行：每个岗位一行，取"当前最完整的样子"。
+
+        【为什么要做 LAST 与 DETAIL 两表合并，而不是直接取最新快照】
+            最新快照的详情字段有两种可能来源：
+              ① 这一轮真抓了详情      → 字段齐全
+              ② 这一轮跳过了详情      → 字段由增量回填填上，也齐全
+            但还有第三种：这一轮**该抓却没轮到**（分块抓取时超出
+            `--detail-limit` 的尾段）。这种快照的详情字段是空的，
+            而历史里明明有值。
+            直接取最新快照就会把有值的字段洗成空——所以这里用
+            COALESCE 做一次兜底：最新快照没值就退回该岗位最近一次
+            详情快照。这与增量回填是同一个原则的不同落点，
+            都建立在 ODS「只追加、历史可追溯」之上。
+
+        :return: 岗位字典列表（含 DWD 需要的全部源字段）
+        """
+        sql = """
+        SELECT l.job_key,
+               l.source, l.source_job_id, l.url, l.crawled_at,
+               l.company, l.title,
+               l.salary, l.education, l.publish_date,
+               COALESCE(NULLIF(l.apply_method, ''), d.apply_method)   AS apply_method,
+               COALESCE(NULLIF(l.city, ''),           d.city)           AS city,
+               COALESCE(NULLIF(l.major_requirement,''), d.major_requirement)
+                                                                      AS major_requirement,
+               COALESCE(NULLIF(l.deadline, ''),       d.deadline)       AS deadline,
+               COALESCE(NULLIF(l.industry, ''),       d.industry)       AS industry,
+               COALESCE(NULLIF(l.company_nature, ''), d.company_nature) AS company_nature,
+               COALESCE(NULLIF(l.company_scale, ''),  d.company_scale)  AS company_scale,
+               COALESCE(NULLIF(l.experience, ''),     d.experience)     AS experience,
+               COALESCE(NULLIF(l.job_category, ''),   d.job_category)   AS job_category,
+               COALESCE(NULLIF(l.language_req, ''),   d.language_req)   AS language_req,
+               COALESCE(NULLIF(l.headcount, ''),      d.headcount)      AS headcount,
+               COALESCE(NULLIF(l.city_detail, ''),    d.city_detail)    AS city_detail,
+               MAX(COALESCE(l.detail_schema_version, 0),
+                   COALESCE(d.detail_schema_version, 0))                 AS detail_schema_version
+          FROM (SELECT s.* FROM ods_job_snapshot s
+                  JOIN (SELECT job_key, MAX(snapshot_id) AS sid
+                          FROM ods_job_snapshot GROUP BY job_key) t
+                    ON s.snapshot_id = t.sid) l
+          LEFT JOIN (SELECT s.* FROM ods_job_snapshot s
+                       JOIN (SELECT job_key, MAX(snapshot_id) AS sid
+                               FROM ods_job_snapshot
+                              WHERE detail_fetched = 1 GROUP BY job_key) t
+                         ON s.snapshot_id = t.sid) d
+            ON l.job_key = d.job_key
+         ORDER BY l.job_key
+        """
+        with connect(self.db_path) as conn:
+            rows = conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+    # ===============================================================
     # 统计
     # ===============================================================
     def count_snapshots(self) -> int:
@@ -566,9 +667,6 @@ class OdsRepository:
             last_seen = conn.execute(
                 "SELECT MAX(crawled_at) FROM ods_job_snapshot").fetchone()[0]
 
-        rules = {}
-        for rule in ("SN:same",):
-            pass
         # 变更统计：有多少职位出现过内容变化
         changed = {r["job_key"] for r in self.recent_changes(days=3650)}
 
