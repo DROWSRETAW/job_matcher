@@ -647,6 +647,55 @@ class TestDependencyCheck:
         assert "运行说明.md" in out, "必须指向详细文档"
 
 
+class TestDisplayPad:
+    """
+    终端表格按「显示宽度」对齐，不是按字符个数。
+
+    背景（实际踩到）：批次台账的状态列里一旦出现 status=failed，
+    前一行末尾就被挤成 `0failed`，看起来像程序出错，其实是排版问题——
+    中文在终端占两列，Python 的 str.format 却按一个字符算宽度。
+    """
+
+    def test_ascii_only(self):
+        import main
+
+        assert main._disp_pad("ok", 6) == "    ok"
+        assert main._disp_pad("failed", 8, "left") == "failed  "
+
+    def test_cjk_counts_as_two_columns(self):
+        import main
+
+        # 两个汉字 = 4 显示列；宽度 8 时应补 4 个空格，而不是 6 个
+        assert main._disp_pad("状态", 8) == "    状态"
+
+    def test_ascii_and_cjk_reach_same_display_width(self):
+        """这是排版问题的本质：不同内容的输出必须占同样的列数"""
+        import main
+        import unicodedata
+
+        def shown(s):
+            return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                       for c in s)
+
+        a = main._disp_pad("状态", 8)
+        b = main._disp_pad("failed", 8)
+        c = main._disp_pad("ok", 8)
+        assert shown(a) == shown(b) == shown(c) == 8
+
+    def test_overlong_text_is_not_truncated(self):
+        """超宽内容不能被截断——宁可超出，也不要丢信息"""
+        import main
+
+        assert main._disp_pad("failed", 4, "left") == "failed"
+        assert main._disp_pad("非常长的中文内容", 4, "left") == "非常长的中文内容"
+
+    def test_numbers_are_padded(self):
+        import main
+
+        assert main._disp_pad(0, 5) == "    0"
+        assert main._disp_pad(294, 5) == "  294"
+
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "--tb=short"]))

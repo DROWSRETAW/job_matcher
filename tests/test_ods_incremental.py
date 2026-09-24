@@ -300,6 +300,63 @@ class TestBatchLedger:
         when = datetime(2026, 9, 21, 10, 52, 30)
         assert new_batch_id(when) == "20260921_105230"
 
+    # ---- 孤儿批次（2026-09-24 新增）----
+    #
+    # 背景：进程被强杀时 close_batch 根本没机会执行，批次会永远挂在
+    # running。台账里出现「永远在跑」的批次是假账——监控会误判，
+    # 人工排查时也分不清「真的在跑」还是「死了没埋」。
+
+    @staticmethod
+    def _rewind(ods, batch_id, hours):
+        """把批次的开始时间往前拨，模拟一个很久以前开、但没收尾的批次"""
+        from core.dbutil import connect
+        stamp = (datetime.now() - timedelta(hours=hours)).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        with connect(ods.db_path) as conn:
+            conn.execute(
+                "UPDATE ods_crawl_batch SET started_at = ? WHERE batch_id = ?",
+                (stamp, batch_id))
+
+    def test_fresh_running_batch_is_not_orphan(self, ods):
+        """★ 刚开始跑的批次不能被当成孤儿——否则会误伤正在执行的任务"""
+        ods.open_batch("b_now", "incremental")
+        assert ods.orphan_batches(stale_hours=6) == []
+
+    def test_stale_running_batch_is_orphan(self, ods):
+        ods.open_batch("b_old", "incremental")
+        self._rewind(ods, "b_old", hours=30)
+
+        orphans = ods.orphan_batches(stale_hours=6)
+        assert [b["batch_id"] for b in orphans] == ["b_old"]
+
+    def test_closed_batch_is_not_orphan(self, ods):
+        """已正常收尾的批次，无论放多久都不该被再动一次"""
+        ods.open_batch("b_done", "incremental")
+        ods.close_batch("b_done", status="ok", list_items=5)
+        self._rewind(ods, "b_done", hours=30)
+
+        assert ods.orphan_batches(stale_hours=6) == []
+
+    def test_close_orphan_batches_marks_failed(self, ods):
+        ods.open_batch("b1", "incremental")
+        ods.open_batch("b2", "incremental")
+        self._rewind(ods, "b1", hours=30)
+        self._rewind(ods, "b2", hours=30)
+        ods.open_batch("b_fresh", "incremental")      # 这条不该被动
+
+        closed = ods.close_orphan_batches(stale_hours=6)
+
+        assert sorted(closed) == ["b1", "b2"]
+        for bid in ("b1", "b2"):
+            b = ods.get_batch(bid)
+            assert b["status"] == "failed"
+            assert b["finished_at"], "收尾必须写上结束时间"
+            assert b["note"], "要说明为什么被标记为 failed"
+        assert ods.get_batch("b_fresh")["status"] == "running"
+
+    def test_no_orphan_returns_empty(self, ods):
+        assert ods.close_orphan_batches(stale_hours=6) == []
+
 
 # ===================================================================
 # 3. 增量判定

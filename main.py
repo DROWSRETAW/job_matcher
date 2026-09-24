@@ -577,6 +577,26 @@ def _print_ods_overview(ods: OdsRepository) -> None:
               "（用 --ods-changes 查看具体是哪变了）")
 
 
+def _disp_pad(text: str, width: int, align: str = "right") -> str:
+    """
+    按「显示宽度」对齐，而不是按字符个数。
+
+    为什么不能用 f"{'状态':>6}"：中文一个字在终端占两列，Python 却按
+    一个字符算宽度，于是表头和数据行错位。批次台账里一旦出现
+    status=failed（6 字符），前一行末尾就会被挤成 `0failed`，
+    看起来像程序出错，其实是排版问题。
+    这里用 east_asian_width 判断宽字符（W/F 记为 2 列）再补空格。
+    """
+    import unicodedata
+
+    shown = sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                for c in str(text))
+    gap = max(width - shown, 0)
+    if align == "left":
+        return str(text) + " " * gap
+    return " " * gap + str(text)
+
+
 def show_ods_stats(limit: int = 8):
     """查看 ODS 贴源层与抓取批次台账"""
     ods = OdsRepository()
@@ -600,13 +620,24 @@ def show_ods_stats(limit: int = 8):
     batches = ods.recent_batches(limit=limit)
     if batches:
         print(f"\n  最近 {len(batches)} 个批次：")
-        print(f"    {'批次号':<18}{'模式':<13}{'列表':>5}{'新增':>6}"
-              f"{'有变':>6}{'免抓详情':>9}{'状态':>6}")
+        header = (
+            _disp_pad("批次号", 18, "left") + _disp_pad("模式", 14, "left")
+            + _disp_pad("列表", 7) + _disp_pad("新增", 7)
+            + _disp_pad("有变", 7) + _disp_pad("免抓详情", 11)
+            + "  " + _disp_pad("状态", 8, "left")
+        )
+        print("    " + header)
         for b in batches:
-            print(f"    {b['batch_id']:<18}{(b['mode'] or ''):<13}"
-                  f"{(b['list_items'] or 0):>5}{(b['new_jobs'] or 0):>6}"
-                  f"{(b['changed_jobs'] or 0):>6}{(b['detail_skipped'] or 0):>9}"
-                  f"{(b['status'] or ''):>6}")
+            row = (
+                _disp_pad(b["batch_id"], 18, "left")
+                + _disp_pad(b["mode"] or "", 14, "left")
+                + _disp_pad(b["list_items"] or 0, 7)
+                + _disp_pad(b["new_jobs"] or 0, 7)
+                + _disp_pad(b["changed_jobs"] or 0, 7)
+                + _disp_pad(b["detail_skipped"] or 0, 11)
+                + "  " + _disp_pad(b["status"] or "", 8, "left")
+            )
+            print("    " + row)
 
     print("\n  说明：")
     print("    「列表」= 本批从列表页取到的岗位数")
@@ -810,6 +841,11 @@ def build_parser():
         help="从 ODS 重放历史重建最新状态层（不联网、不消耗站点请求）"
     )
     mode.add_argument(
+        "--close-orphan-batches", action="store_true",
+        help="把长时间挂在 running 的批次收尾为 failed"
+             "（进程被强杀时会留下这种批次，收尾后台账才可信）"
+    )
+    mode.add_argument(
         "--no-incremental", action="store_true",
         help="关闭增量，全部岗位重抓详情（排查「数据没更新」时用）"
     )
@@ -941,6 +977,19 @@ def main():
 
     if args.ods_changes is not None:
         show_ods_changes(args.ods_changes)
+        return 0
+
+    if args.close_orphan_batches:
+        ods = OdsRepository()
+        orphans = ods.orphan_batches()
+        if not orphans:
+            print("没有需要收尾的孤儿批次。")
+        else:
+            closed = ods.close_orphan_batches()
+            print(f"已收尾 {len(closed)} 个孤儿批次（标记为 failed）：")
+            for b in orphans:
+                print(f"  {b['batch_id']}  开始于 {b['started_at']}"
+                      f"  模式 {b['mode']}")
         return 0
 
     if args.rebuild_state:

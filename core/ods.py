@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from config import DB_PATH, ODS_SOURCE_KEY
+from config import DB_PATH, ODS_SOURCE_KEY, ORPHAN_BATCH_HOURS
 from core.dbutil import connect, ensure_columns
 from core.models import Job, list_fingerprint, content_fingerprint
 
@@ -285,6 +285,59 @@ class OdsRepository:
                  mode, profile_json),
             )
         return batch_id
+
+    def orphan_batches(self, stale_hours: float = ORPHAN_BATCH_HOURS) -> List[dict]:
+        """
+        找出「挂着 running 但其实早就死了」的批次。
+
+        为什么需要：进程被强杀（工具超时、断网、直接关窗口）时，
+        close_batch 根本没机会执行，批次就永远停在 running。
+        ODS 台账里出现「永远在跑」的批次是一种假账——监控会误判，
+        人工排查时也分不清「真的在跑」还是「死了没埋」。
+
+        :param stale_hours: 只认开始时间早于这么久之前的批次，
+                            避免误伤正在进行中的任务
+        """
+        if stale_hours is None or stale_hours < 0:
+            stale_hours = ORPHAN_BATCH_HOURS
+        cutoff = (datetime.now() - timedelta(hours=stale_hours)) \
+            .strftime("%Y-%m-%d %H:%M:%S")
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ods_crawl_batch
+                 WHERE status = 'running'
+                   AND finished_at IS NULL
+                   AND (started_at IS NULL OR started_at < ?)
+                 ORDER BY started_at
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def close_orphan_batches(self, stale_hours: float = ORPHAN_BATCH_HOURS,
+                             note: str = "") -> List[str]:
+        """
+        把孤儿批次收尾为 failed。
+
+        :return: 被收尾的批次号列表
+        """
+        orphans = self.orphan_batches(stale_hours)
+        if not orphans:
+            return []
+
+        note = note or f"进程被外部中断，未正常收尾（于 {datetime.now():%Y-%m-%d %H:%M} 补记）"
+        closed = []
+        with connect(self.db_path) as conn:
+            for b in orphans:
+                conn.execute(
+                    "UPDATE ods_crawl_batch SET status = 'failed', "
+                    "finished_at = ?, note = ? WHERE batch_id = ?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note,
+                     b["batch_id"]),
+                )
+                closed.append(b["batch_id"])
+        return closed
 
     def close_batch(self, batch_id: str, status: str = "ok",
                     note: str = "", **counters) -> None:
