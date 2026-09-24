@@ -129,6 +129,7 @@ plan_detail_fetch()（输入列表结果 + ODS 状态，输出抓取计划）。
 - 数据仅供个人求职使用
 ────────────────────────────────────────────────────────────────
 """
+import json
 import re
 import sys
 import time
@@ -146,7 +147,7 @@ from config import (
     SEARCH_MAX_PAGES,
     CITY_CODES, EDUCATION_CODES, CATEGORY_CODES, TIME_CODES,
     NATURE_CODES, SCALE_CODES, MAJOR_CODES, DEFAULT_MAJOR_KEYS,
-    DETAIL_MAX_CONSECUTIVE_FAILURES,
+    DETAIL_MAX_CONSECUTIVE_FAILURES, DETAIL_SCHEMA_VERSION,
 )
 from core.decoder import decode_embedded_html, probe_encoding
 from core.models import Job, make_job_key, list_fingerprint
@@ -266,6 +267,19 @@ class SearchProfile:
             "max_pages": self.max_pages,
         }
 
+    # ---------------------------------------------------------------
+    # 检索口径指纹（2026-09-24 新增）
+    # ---------------------------------------------------------------
+    # 决定「向站点要的是哪一批岗位」的字段。
+    # max_pages 不在其中：它只限制翻多少页，不改变"哪些岗位符合条件"，
+    # 而"翻页被截断"由 _can_judge_missing 的另一条前提单独兜住。
+    SCOPE_FIELDS = ("city", "education", "category", "majors",
+                    "time_range", "salary_min", "nature", "scale")
+
+    def scope_key(self) -> tuple:
+        """本批检索口径指纹，用于判断「两批问的是不是同一个问题」"""
+        return profile_scope(self)
+
     @classmethod
     def from_dict(cls, data: Optional[dict]) -> "SearchProfile":
         if not data:
@@ -288,6 +302,83 @@ class SearchProfile:
         if not p.exists():
             return cls()
         return cls.from_dict(json.loads(p.read_text(encoding="utf-8")))
+
+
+def _as_profile(source) -> Optional["SearchProfile"]:
+    """
+    把三种来源统一成 SearchProfile：实例 / dict / profile_json 字符串。
+
+    无法识别或内容为空时返回 None（**不返回一个用了默认值的 profile**——
+    那会把"没有可比口径"伪装成"口径一致"，闸门就白设了）。
+    """
+    if isinstance(source, SearchProfile):
+        return source
+    if source is None:
+        return None
+    if isinstance(source, str):
+        if not source.strip():
+            return None
+        try:
+            source = json.loads(source)
+        except ValueError:
+            return None
+    if not isinstance(source, dict) or not source:
+        # 也接受 profile_scope() 的产出（(("city","厦门"), ...)），
+        # 这样"提示语"可以直接拿口径元组来渲染，不必回头找原对象。
+        if (isinstance(source, tuple) and source
+                and all(isinstance(x, tuple) and len(x) == 2 for x in source)):
+            source = dict(source)
+        else:
+            return None
+    # 值为 None 的字段先剔掉，交给 dataclass 的默认值兜底。
+    # 反序列化会原样保留 null，而 SearchProfile(nature=None) 与
+    # SearchProfile() 是两个不同的对象，不剔就会误报"口径不同"。
+    return SearchProfile.from_dict({k: v for k, v in source.items()
+                                    if v is not None})
+
+
+def profile_scope(source) -> tuple:
+    """
+    把检索口径压成一个可比较的元组。
+
+    :param source: SearchProfile 实例、dict，或批次台账里的 profile_json 字符串
+    :return: 形如 (("city", "厦门"), ("majors", ("数学类",)), ...)；
+             无法识别时返回 ()（调用方按"没有可比口径"处理）
+
+    【为什么要做归一】
+        profile_json 是历史批次写的，字段可能缺失或为 null；
+        而内存里的 SearchProfile 有默认值。两边直接比会因
+        None vs "" / list vs tuple 的差异误判成"口径不同"，
+        于是下架判定每次都被挡掉——闸门本身变成了故障源。
+
+    【这个元组用来干什么】
+        把「列表里没出现」当成「下架」，前提是**两批问的是同一个问题**。
+        口径一变窄，返回的岗位数自然变少，少掉的那些完全可能还在招，
+        按"没出现"判下架就是大规模错杀。详见 main.py 的 _can_judge_missing。
+    """
+    profile = _as_profile(source)
+    if profile is None:
+        return ()
+
+    out = []
+    for name in SearchProfile.SCOPE_FIELDS:
+        value = getattr(profile, name)
+        if name == "majors":
+            out.append((name, tuple(sorted(str(x) for x in (value or [])))))
+        else:
+            out.append((name, "" if value is None else str(value)))
+    return tuple(out)
+
+
+def describe_scope(source) -> str:
+    """把口径印成人看得懂的一行，用于"口径不一致"的提示语"""
+    data = dict(profile_scope(source)) or {}
+    majors = "/".join(data.get("majors") or ()) or "不限"
+    return (f"城市={data.get('city') or '不限'} · "
+            f"学历={data.get('education') or '不限'} · "
+            f"性质={data.get('category') or '不限'} · "
+            f"发布={data.get('time_range') or '不限'} · "
+            f"专业={majors}")
 
 
 # ===================================================================
@@ -681,6 +772,18 @@ class XmuCareerSpider(BaseSpider):
                     job.industry = detail.industry
                 if detail.company_scale and not job.company_scale:
                     job.company_scale = detail.company_scale
+                # 详情页独有的岗位属性（2026-09-24 新增）：
+                # 列表页没有这几项，所以详情值直接取，不需要"列表优先"的判断。
+                # 只在详情给了值时覆盖 —— 页面偶发缺值时保留原值，
+                # 不把「这次没解析到」写成「这个岗位没有」。
+                for name in ("experience", "job_category", "language_req",
+                             "headcount", "city_detail"):
+                    value = getattr(detail, name, "")
+                    if value:
+                        setattr(job, name, value)
+                # 解析器版本号：证明这条快照是「新版解析器抓到的」，
+                # 增量据此判断老快照要不要补字段（见 config.DETAIL_SCHEMA_VERSION）
+                job.detail_schema_version = detail.detail_schema_version
                 # 页面成功解析即算「这次真抓到了详情」。
                 # 若页面本身没写专业要求（parse 会返回空列表），
                 # detail_fetched 仍为 False，下次会再试一次。
@@ -820,6 +923,7 @@ class XmuCareerSpider(BaseSpider):
 
         meta = self._parse_meta_block(lines)
         company_block = self._parse_company_block(soup, lines)
+        attrs = self._parse_job_attrs_block(soup, lines)
 
         job = Job(
             title=title,
@@ -832,6 +936,16 @@ class XmuCareerSpider(BaseSpider):
             industry=company_block["industry"],
             company_nature=company_block["nature"],
             company_scale=company_block["scale"],
+            # 详情页的 city 是完整三级（"福建省厦门市湖里区"），
+            # 列表页只到市一级。单独存一列，不覆盖 city —— 理由见
+            # core/models.py 中 Job.city_detail 的注释（city 参与列表指纹）。
+            city_detail=meta["city"],
+            experience=attrs["experience"],
+            job_category=attrs["job_category"],
+            language_req=attrs["language_req"],
+            headcount=attrs["headcount"],
+            # 标记「这条是由第几版解析器产生的」，供增量判断老快照要不要补字段
+            detail_schema_version=DETAIL_SCHEMA_VERSION,
             apply_method=url,
             source="厦门大学就业信息网",
             url=url,
@@ -974,29 +1088,32 @@ class XmuCareerSpider(BaseSpider):
         return ""
 
     # -----------------------------------------------------------------
-    # 单位属性解析（2026-09-23 新增）
+    # 通用「标签：值」块解析
     # -----------------------------------------------------------------
     @staticmethod
-    def _parse_company_block(soup: BeautifulSoup, lines: List[str]) -> dict:
+    def _parse_labeled_block(soup: BeautifulSoup, lines: List[str],
+                             labels: dict) -> dict:
         """
-        解析详情页底部的公司信息块：单位性质 / 单位行业 / 单位规模。
+        解析详情页里「标签独占一行、值占下一行」的字段块。
 
-        :return: {"nature": 单位性质, "industry": 单位行业, "scale": 单位规模}
+        :param labels: {标签前缀: 结果键}，如 {"单位性质": "nature"}
+        :return: {结果键: 值}
 
-        实测到的真实结构（2026-09-23 对 jy.xmu.edu.cn 抓取确认）：
-            <div class="info"><div style="padding-top: 15px;">
-              <div class="item"><label class="label">单位性质：</label><span>国有企业</span></div>
-              <div class="item"><label class="label">单位行业：</label><span>交通运输、仓储和邮政业</span></div>
-              <div class="item"><label class="label">单位规模：</label><span>10000人以上</span></div>
-            </div></div>
+        实测到的真实结构（2026-09-24 对 jy.xmu.edu.cn 抓取确认）：
+            <div class="item"><label class="label">单位性质：</label><span>国有企业</span></div>
 
-        文本层面则是「标签独占一行、值占下一行」：
-            86 | '单位性质：'
-            87 | '国有企业'
-            88 | '单位行业：'
-            89 | '交通运输、仓储和邮政业'
-            90 | '单位规模：'
-            91 | '10000人以上'
+        文本层面（单位属性块与岗位属性块同构）：
+            80 | '职能类别：'
+            81 | '内容运营'
+            82 | '招聘人数：'
+            83 | '16人'
+            84 | '工作经验：'
+            85 | '应届毕业生'
+            86 | '语言要求：'
+            87 | '不限'
+            ...
+            90 | '单位性质：'
+            91 | '国有企业'
 
         两路解析的理由与 _parse_company 一致：结构化选择器最准，
         但站点改版换掉 class 时它会静默返回空。留一条按行扫描的兜底，
@@ -1005,8 +1122,7 @@ class XmuCareerSpider(BaseSpider):
         注意：这里**不做归一化**。ODS 只记录页面怎么写，
         「国有企业 / 国企 / 中央企业」这类归一属于 DWD 的活。
         """
-        result = {"nature": "", "industry": "", "scale": ""}
-        labels = {"单位性质": "nature", "单位行业": "industry", "单位规模": "scale"}
+        result = {key: "" for key in labels.values()}
 
         # ---- 路 1：结构化 <label> + 相邻 <span> ----
         for label in soup.find_all("label"):
@@ -1035,6 +1151,52 @@ class XmuCareerSpider(BaseSpider):
                     result[key] = nxt
 
         return result
+
+    # -----------------------------------------------------------------
+    # 单位属性解析（2026-09-23 新增）
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _parse_company_block(soup: BeautifulSoup, lines: List[str]) -> dict:
+        """
+        解析详情页底部的公司信息块：单位性质 / 单位行业 / 单位规模。
+
+        :return: {"nature": 单位性质, "industry": 单位行业, "scale": 单位规模}
+
+        取值逻辑见 _parse_labeled_block（两个块的结构完全同构）。
+        """
+        return XmuCareerSpider._parse_labeled_block(
+            soup, lines,
+            {"单位性质": "nature", "单位行业": "industry", "单位规模": "scale"},
+        )
+
+    # -----------------------------------------------------------------
+    # 岗位属性解析（2026-09-24 新增）
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _parse_job_attrs_block(soup: BeautifulSoup, lines: List[str]) -> dict:
+        """
+        解析详情页的岗位属性块。
+
+        :return: {"job_category": 职能类别, "headcount": 招聘人数,
+                  "experience": 工作经验, "language_req": 语言要求}
+
+        【为什么补这几个字段】
+        规划里 DWD 的技能抽取要用「详情正文」，但实测该站点的「职位详情」
+        是一个**空标签页**——页面上只有标签名，没有任何正文（2026-09-24
+        抓 6 个详情页确认）。而同一个元信息区域里真正有值的是这四个字段：
+
+            · 工作经验  缺口分析里点名「经验字段根本没采集」，它就是正解
+            · 职能类别  站点用下拉框维护的标准分类，是现成的职能标签
+            · 语言要求  外语能力要求的唯一来源
+            · 招聘人数  岗位规模，做需求趋势时的辅助维度
+
+        它们是站点结构化维护的，比从自由正文里猜技能更可靠。
+        """
+        return XmuCareerSpider._parse_labeled_block(
+            soup, lines,
+            {"职能类别": "job_category", "招聘人数": "headcount",
+             "工作经验": "experience", "语言要求": "language_req"},
+        )
 
     @staticmethod
     def _parse_deadline(soup: BeautifulSoup) -> str:

@@ -38,6 +38,40 @@ class Job:
     company_nature: str = ""     # 单位性质，如「国有企业」
     company_scale: str = ""      # 单位规模，如「10000人以上」
 
+    # ---- 详情页的结构化字段（2026-09-24 新增）----
+    # 【为什么是这几个，而不是"详情正文"】
+    #   规划里 DWD 技能抽取的第三个来源写的是「详情正文」。实测该站点上
+    #   「职位详情」是一个**空标签页**（2026-09-24 抓 6 个详情页确认，
+    #   页面只有标签名、没有任何正文）。同一区域真正有值的是下面这几个
+    #   结构化字段——它们比正文更适合做分析，因为是站点用下拉框维护的：
+    #
+    #   experience    工作经验：站点原样值（"应届毕业生" / "不限" / "1-3年"）
+    #                 ★ 缺口分析点名「经验字段根本没采集」，这一项直接补上
+    #   job_category  职能类别：站点自带的标准分类（"内容运营" / "业务拓展"）
+    #                 它替代了不可用的"详情正文"，成为技能抽取的第三个来源
+    #   language_req  语言要求（"不限" / "英语"）
+    #   headcount     招聘人数：站点原样文本（"3人" / "99人"）
+    #   city_detail   详情页的完整工作地点（"福建省厦门市湖里区"）
+    #                 ★ 列表页只给到市（"福建省厦门市"），**95% 的岗位因此
+    #                 拿不到区县**，DWD 的城市三级拆分沦为空谈。详情页才
+    #                 有区级，所以单独存一列，不覆盖 city。
+    #
+    #   ⚠️ 为什么不直接覆盖 city：city 参与 LIST_FINGERPRINT_FIELDS。
+    #   若用详情页的值覆盖它，同一条岗位在「列表阶段」与「写库阶段」会算出
+    #   不同的列表指纹，下一轮增量必然误判成"列表有变"而全量重抓。
+    #   加一列而不是改一列，是这一约束下的唯一选择。
+    experience: str = ""         # 工作经验（站点原样值）
+    job_category: str = ""       # 职能类别（站点原样值）
+    language_req: str = ""       # 语言要求（站点原样值）
+    headcount: str = ""          # 招聘人数（站点原样值）
+    city_detail: str = ""        # 详情页的完整工作地点（含区县）
+
+    # 本条记录是由哪一版详情解析器产生的（0 = 没有抓到过详情）。
+    # 见 config.DETAIL_SCHEMA_VERSION：解析器学会新字段时 +1，
+    # 增量据此把老快照排进重抓队列。它是血缘标记，**不进指纹**——
+    # 它描述的是"谁解析的"，不是"内容是什么"。
+    detail_schema_version: int = 0
+
     # ---- 打分阶段填充 ----
     match_score: int = 0                 # 匹配总分
     match_level: str = ""                # 匹配等级 S/A/B/C
@@ -100,7 +134,11 @@ class Job:
 #   否则同一条岗位，抓了详情时算出指纹 A、跳过详情时算出指纹 B，
 #   每次增量跑都会被误判成「内容有变化」，change_count 一路虚增。
 #   这就是 company_nature 必须纳入回填表的原因——它只有详情页有。
-#   （回填机制见 core/incremental.py 的 DetailFields / apply_backfill）
+#   （回填机制见 core/incremental.py 的 BackfillFields / apply_backfill）
+#
+#   2026-09-24 新增的 experience / job_category / language_req / headcount /
+#   city_detail 五项**全部只有详情页有**，所以全部登记进了 BackfillFields。
+#   加它们时漏登记任何一项，都会立刻表现为 change_count 每天虚增。
 
 LIST_FINGERPRINT_FIELDS = (
     "company", "title", "city", "salary", "education", "publish_date",
@@ -108,6 +146,9 @@ LIST_FINGERPRINT_FIELDS = (
 CONTENT_FINGERPRINT_FIELDS = LIST_FINGERPRINT_FIELDS + (
     "major_requirement", "deadline",
     "industry", "company_nature", "company_scale",
+    # 以下五项只有详情页有（2026-09-24 新增）。
+    # city_detail 单列而不合并进 city，理由见 Job 定义处的注释。
+    "experience", "job_category", "language_req", "headcount", "city_detail",
 )
 
 

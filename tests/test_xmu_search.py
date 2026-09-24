@@ -15,6 +15,7 @@
 页面片段取自 2026-09-20 对 jy.xmu.edu.cn 的真实抓取结果。
 """
 import base64
+import json
 import sys
 import zlib
 from pathlib import Path
@@ -27,7 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import MAJOR_CODES, DEFAULT_MAJOR_KEYS  # noqa: E402
 from core.decoder import decode_embedded_html, probe_encoding, unzip_base64  # noqa: E402
 from core.models import Job, make_job_key  # noqa: E402
-from spiders.xmu_career import SearchProfile, XmuCareerSpider  # noqa: E402
+from spiders.xmu_career import (  # noqa: E402
+    SearchProfile, XmuCareerSpider, profile_scope, describe_scope,
+)
+from main import _can_judge_missing  # noqa: E402
 
 
 # ===================================================================
@@ -658,3 +662,222 @@ class TestCodeTables:
     def test_xinxiyujisuan_kexue_code(self):
         """这个代码错了，整个专业筛选就失效"""
         assert MAJOR_CODES["信息与计算科学"] == "112003"
+
+
+# ===================================================================
+# 9. 检索口径指纹
+# ===================================================================
+class TestProfileScope:
+    def test_same_profile_same_scope(self):
+        a = SearchProfile(city="厦门", majors=["数学类"])
+        b = SearchProfile(city="厦门", majors=["数学类"])
+        assert profile_scope(a) == profile_scope(b)
+
+    def test_major_order_does_not_matter(self):
+        """专业是 OR 关系，顺序不影响"问的是哪一批岗位" """
+        a = SearchProfile(majors=["数学类", "统计学"])
+        b = SearchProfile(majors=["统计学", "数学类"])
+        assert profile_scope(a) == profile_scope(b)
+
+    @pytest.mark.parametrize("field, value", [
+        ("city", "福州"),
+        ("education", "硕士"),
+        ("category", "实习"),
+        ("time_range", "近1周"),
+        ("salary_min", 8000),
+        ("nature", "国有企业"),
+        ("scale", "500-1000人"),
+    ])
+    def test_any_scope_field_change_is_detected(self, field, value):
+        base = SearchProfile()
+        changed = SearchProfile(**{field: value})
+        assert profile_scope(base) != profile_scope(changed), \
+            f"{field} 变了，口径指纹却没变"
+
+    def test_majors_change_is_detected(self):
+        """★ 本次踩到的就是这个：专业口径一变窄，结果数骤降"""
+        wide = SearchProfile(majors=[])
+        narrow = SearchProfile(majors=list(DEFAULT_MAJOR_KEYS))
+        assert profile_scope(wide) != profile_scope(narrow)
+
+    def test_max_pages_is_not_part_of_scope(self):
+        """翻页上限不改变"哪些岗位符合条件"，不属于口径"""
+        base = SearchProfile(max_pages=None)
+        limited = SearchProfile(max_pages=2)
+        assert profile_scope(base) == profile_scope(limited)
+
+    def test_accepts_plain_dict(self):
+        """批次台账里的 profile_json 反序列化后就是 dict，要能直接比"""
+        p = SearchProfile(city="厦门", majors=["数学类"], nature="国有企业")
+        assert profile_scope(p.to_dict()) == profile_scope(p)
+
+    def test_accepts_json_string(self):
+        """
+        ★ 批次台账里存的 profile_json 是**字符串**，不是 dict。
+        必须先反序列化再比，否则闸门会直接抛异常（本次踩到过）。
+        """
+        p = SearchProfile(city="厦门", majors=["数学类"], nature="国有企业")
+        raw = json.dumps(p.to_dict(), ensure_ascii=False)
+        assert profile_scope(raw) == profile_scope(p)
+
+    def test_dict_with_missing_and_none_fields(self):
+        """
+        ★ 归一化的意义：老批次的 profile_json 可能缺字段或为 null。
+        若直接比较，None vs 默认值会被误判成"口径不同"，
+        闸门会把本该成立的下架判定全部挡掉——闸门自己成了故障源。
+        """
+        p = SearchProfile(city="厦门", majors=["数学类"])
+        partial = {"city": "厦门", "majors": ["数学类"],
+                   "nature": None, "salary_min": None}
+        assert profile_scope(partial) == profile_scope(p)
+
+    @pytest.mark.parametrize("bad", [None, "", "   ", "{}", "{不是json", 123, []])
+    def test_unusable_sources_give_empty_scope(self, bad):
+        """
+        ★ 认不出来就返回空元组，**不能**套一套默认值返回。
+
+        否则"没有可比口径"会被伪装成"口径一致"，闸门就白设了。
+        """
+        assert profile_scope(bad) == ()
+
+    def test_json_roundtrip_matches(self):
+        """profile_json 存的是 JSON，往返一次口径指纹必须不变"""
+        import json
+        p = SearchProfile(city="厦门", majors=["数学类", "统计学"],
+                          nature="国有企业", salary_min=5000)
+        restored = json.loads(json.dumps(p.to_dict(), ensure_ascii=False))
+        assert profile_scope(restored) == profile_scope(p)
+
+    def test_describe_scope_is_readable(self):
+        text = describe_scope(SearchProfile(city="厦门", majors=["数学类"]))
+        assert "厦门" in text and "数学类" in text
+        assert "不限" in describe_scope(SearchProfile(majors=[]))
+
+
+# ===================================================================
+# 10. 下架判定闸门（main._can_judge_missing 的三条前提）
+# ===================================================================
+class _FakeSpider:
+    """只需要 .stats 里的总页数，用来模拟"翻页有没有触顶" """
+
+    def __init__(self, total_pages=1):
+        self.stats = {"total_pages": total_pages}
+
+
+class _FakeOds:
+    """只提供 recent_batches()，喂入构造好的批次台账"""
+
+    def __init__(self, batches):
+        self._batches = batches
+
+    def recent_batches(self, limit=20):
+        return self._batches[:limit]
+
+
+def _batch(status, profile):
+    import json
+    return {"status": status,
+            "profile_json": json.dumps(profile.to_dict(), ensure_ascii=False)}
+
+
+class TestCanJudgeMissing:
+    """
+    这三条前提决定"会不会把还在招的岗位标成下架"。
+    判错方向的代价是单向的：标错了，卢兄会以为岗位没了而放弃投递。
+    """
+
+    def _same(self, **kw):
+        """上一批与这一批口径完全一致"""
+        p = SearchProfile(**kw)
+        return p, _FakeOds([_batch("ok", p)])
+
+    def test_all_premises_hold(self):
+        profile, ods = self._same()
+        can, why = _can_judge_missing(profile, _FakeSpider(), ods)
+        assert can is True and why == ""
+
+    def test_time_range_limited_blocks(self):
+        """前提 1：检索限定时间时，老岗位不出现属正常"""
+        profile = SearchProfile(time_range="近1周")
+        ods = _FakeOds([_batch("ok", profile)])
+        can, why = _can_judge_missing(profile, _FakeSpider(), ods)
+        assert can is False and "近1周" in why
+
+    def test_pagination_truncated_blocks(self):
+        """前提 2：翻页触顶时可能只是没翻完"""
+        profile, ods = self._same()
+        can, why = _can_judge_missing(profile, _FakeSpider(total_pages=60), ods)
+        assert can is False and "60" in why
+
+    def test_scope_mismatch_blocks(self):
+        """★ 前提 3：口径变窄时，少掉的那些岗位根本没被问过"""
+        wide = SearchProfile(majors=[])
+        narrow = SearchProfile(majors=list(DEFAULT_MAJOR_KEYS))
+        ods = _FakeOds([_batch("ok", wide)])
+        can, why = _can_judge_missing(narrow, _FakeSpider(), ods)
+        assert can is False, "口径不一致时必须不判定"
+        assert "口径" in why
+
+    def test_scope_mismatch_message_names_both_sides(self):
+        """提示语要说清两侧口径，否则排查时不知道该改哪个参数"""
+        wide = SearchProfile(majors=[])
+        narrow = SearchProfile(majors=["数学类"])
+        ods = _FakeOds([_batch("ok", wide)])
+        _, why = _can_judge_missing(narrow, _FakeSpider(), ods)
+        assert "数学类" in why and "不限" in why
+
+    def test_city_change_blocks(self):
+        """换城市也是换口径——福州的口径推不出厦门的岗位在不在"""
+        xiamen = SearchProfile(city="厦门")
+        fuzhou = SearchProfile(city="福州")
+        ods = _FakeOds([_batch("ok", xiamen)])
+        can, _ = _can_judge_missing(fuzhou, _FakeSpider(), ods)
+        assert can is False
+
+    def test_no_comparable_batch_blocks(self):
+        """
+        ★ 找不到可比口径时**不判定**（宁可漏判也不错杀）。
+
+        触发场景：ODS 里有历史数据，但那批数据是旧版本写的、
+        台账里没有 profile_json。此时谁也无法确认口径一致。
+        """
+        can, why = _can_judge_missing(SearchProfile(), _FakeSpider(),
+                                      _FakeOds([]))
+        assert can is False and "口径" in why
+
+    def test_failed_batches_are_skipped(self):
+        """失败批次的口径不可信，应跳过它继续往前找"""
+        good = SearchProfile(majors=[])
+        ods = _FakeOds([
+            {"status": "running", "profile_json": ""},
+            {"status": "failed", "profile_json": "{}"},
+            _batch("ok", good),
+        ])
+        can, _ = _can_judge_missing(SearchProfile(majors=[]), _FakeSpider(), ods)
+        assert can is True, "应跳过 running/failed，采用那条 ok 的口径"
+
+    def test_running_current_batch_is_not_used(self):
+        """
+        当前批在此刻还是 running（close_batch 在判定之后才执行），
+        所以它不会被当成"上一批"——否则永远自比自，闸门形同虚设。
+        """
+        prev = SearchProfile(majors=[])
+        now = SearchProfile(majors=["数学类"])
+        ods = _FakeOds([
+            {"status": "running",
+             "profile_json": json.dumps(now.to_dict(), ensure_ascii=False)},
+            _batch("ok", prev),
+        ])
+        can, _ = _can_judge_missing(now, _FakeSpider(), ods)
+        assert can is False, "应拿 running 之前的 ok 批次来比"
+
+    def test_default_profile_matches_wide_batch(self):
+        """
+        反向确认：库里那 294 条是用 majors=[] 建的，
+        所以再用 majors=[] 跑时闸门必须放行（不能把正常判定也挡掉）。
+        """
+        wide = SearchProfile(majors=[])
+        ods = _FakeOds([_batch("ok", wide)])
+        can, why = _can_judge_missing(SearchProfile(majors=[]),
+                                      _FakeSpider(), ods)
+        assert can is True, f"正常口径被误挡：{why}"

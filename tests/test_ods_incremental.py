@@ -28,9 +28,10 @@ from core.ods import OdsRepository, new_batch_id  # noqa: E402
 from core.incremental import (  # noqa: E402
     plan_detail_fetch, apply_backfill, summarize_plan,
     REASON_NEW, REASON_CHANGED, REASON_NO_DETAIL, REASON_STALE,
-    REASON_UNCHANGED, REASON_FORCED,
+    REASON_UNCHANGED, REASON_FORCED, REASON_OUTDATED,
 )
 from core.storage import JobStorage  # noqa: E402
+from config import DETAIL_SCHEMA_VERSION  # noqa: E402
 
 
 # ===================================================================
@@ -42,18 +43,31 @@ def make_job(jid: str, company: str = "", title: str = "", *,
              major: str = "数学类、信息与计算科学",
              deadline: str = "2026-10-01", detail: bool = True,
              industry: str = "制造业", company_scale: str = "10000人以上",
-             company_nature: str = "国有企业") -> Job:
+             company_nature: str = "国有企业",
+             experience: str = "不限", job_category: str = "计算机/互联网类",
+             language_req: str = "英语", headcount: str = "5",
+             city_detail: str = "福建省厦门市思明区",
+             schema_version: int = None) -> Job:
     """
     造一个岗位，模拟爬虫的产出形状。
 
     :param detail: True 表示已抓过详情页（含专业/截止时间/单位性质），
                    False 表示这是列表页阶段的产物。
+    :param schema_version: 这条快照是由哪一版详情解析器产生的。
+                   None（默认）时：detail=True 用**当前**版本，模拟「本次
+                   刚抓到的新快照」；detail=False 恒为 0——列表阶段压根
+                   没有解析过详情。
+                   想模拟「库里那批旧解析器留下的老快照」，就显式传一个
+                   比当前小的值（例如 0）。
 
     注意 industry / company_scale 无论 detail 与否都给值——
     这两个字段来自列表页，与「抓没抓详情」无关。
     company_nature 则只有详情页才有，detail=False 时必须为空，
     这正是「跳过详情会丢字段」的现实来源。
+    2026-09-24 新增的五个字段同理，全部只在 detail=True 时给值。
     """
+    if schema_version is None:
+        schema_version = DETAIL_SCHEMA_VERSION if detail else 0
     job = Job(
         company=company or f"公司{jid}",
         title=title or f"岗位{jid}",
@@ -64,6 +78,12 @@ def make_job(jid: str, company: str = "", title: str = "", *,
         industry=industry,
         company_scale=company_scale,
         company_nature=company_nature if detail else "",
+        experience=experience if detail else "",
+        job_category=job_category if detail else "",
+        language_req=language_req if detail else "",
+        headcount=headcount if detail else "",
+        city_detail=city_detail if detail else "",
+        detail_schema_version=schema_version,
         source="厦门大学就业信息网",
         url=f"https://jy.xmu.edu.cn/job/view/id/{jid}",
         source_job_id=str(jid),
@@ -255,6 +275,40 @@ class TestOdsSnapshots:
         assert state.major_requirement == "数学类", "回填来源必须是那条含详情的快照"
         assert state.last_batch_id == "b2", "但「最近快照」仍是第二批"
 
+    def test_latest_states_reports_schema_version(self, ods):
+        ods.save_snapshots("b1", [make_job("1")])
+        state = ods.latest_states()["xmu:1"]
+        assert state.detail_schema_version == DETAIL_SCHEMA_VERSION
+
+    def test_skipped_snapshot_does_not_reset_schema_version(self, ods):
+        """
+        ★ 防死循环：跳过详情写下的快照（detail_fetched=0）不能把版本号洗回 0。
+
+        若 latest_states() 取的是「最新快照」的版本号，那么一次
+        「跳过详情」的运行就会把版本号重置成 0，下一轮规则 4b 再次命中，
+        于是每轮都重抓全部详情——永远收敛不了。
+
+        正确的口径是取「最近一次**真正抓到详情**的快照」的版本号。
+        这条用例就是把这个口径钉死。
+        """
+        ods.save_snapshots("b1", [make_job("1", detail=True)])
+        ods.save_snapshots("b2", [make_job("1", detail=False)])   # 跳过详情
+
+        state = ods.latest_states()["xmu:1"]
+        assert state.detail_schema_version == DETAIL_SCHEMA_VERSION, \
+            "版本号必须继承自那条含详情的快照"
+        assert state.last_batch_id == "b2", "但「最近快照」仍是第二批"
+
+    def test_five_new_detail_fields_reach_state(self, ods):
+        """五个新字段要能从快照流到状态层（增量与 DWD 都靠它）"""
+        ods.save_snapshots("b1", [make_job("1", detail=True)])
+        state = ods.latest_states()["xmu:1"]
+        assert state.experience == "不限"
+        assert state.job_category == "计算机/互联网类"
+        assert state.language_req == "英语"
+        assert state.headcount == "5"
+        assert state.city_detail == "福建省厦门市思明区"
+
     def test_recent_changes_only_reports_real_changes(self, ods):
         ods.save_snapshots("b1", [make_job("1", salary="8000-12000")])
         ods.save_snapshots("b2", [make_job("1", salary="8000-12000")])   # 没变
@@ -427,6 +481,37 @@ class TestIncrementalPlan:
         assert ods.latest_states()["xmu:1"].change_count == 0, \
             "跳过详情的第二次抓取不应被记成一次内容变更"
 
+    def test_skipped_job_restores_new_detail_fields(self, ods):
+        """
+        ★ 2026-09-24 新增的五个详情字段，跳过详情时同样必须能回填。
+
+        这五个字段全部进了内容指纹（见 core/models.py 的
+        CONTENT_FINGERPRINT_FIELDS），所以每一个都必须登记进
+        BackfillFields。漏登记任何一个，都会立刻表现为
+        change_count 每次增量跑虚增——而且不会报错。
+        """
+        full = make_job("1", detail=True)
+        ods.save_snapshots("b1", [full])
+
+        fresh = make_job("1", detail=False)
+        new_fields = ("experience", "job_category", "language_req",
+                      "headcount", "city_detail")
+        for name in new_fields:
+            assert getattr(fresh, name) == "", f"前提：列表页拿不到 {name}"
+
+        plan = plan_detail_fetch([fresh], ods.latest_states(), now=self.NOW)
+        assert plan.skipped_count == 1, "内容没变就该跳过详情"
+
+        apply_backfill(plan)
+        for name in new_fields:
+            assert getattr(fresh, name) == getattr(full, name), \
+                f"{name} 必须从历史快照回填"
+        assert content_fingerprint(fresh) == content_fingerprint(full), \
+            "回填后内容指纹必须与上次一致"
+
+        ods.save_snapshots("b2", [fresh])
+        assert ods.latest_states()["xmu:1"].change_count == 0
+
     def test_list_derived_company_fields_are_not_overwritten_by_history(self, ods):
         """
         列表页本次拿到的行业/规模优先，不被历史快照的旧值盖回去。
@@ -466,6 +551,65 @@ class TestIncrementalPlan:
         assert plan.fetch_count == 1
         assert plan.reasons["xmu:1"] == REASON_NO_DETAIL, \
             "上次没抓到详情，这次要补，否则专业字段永远是空的"
+
+    # ---- 规则 4b：旧版解析器产生的快照要补新字段（2026-09-24 新增）----
+    def test_old_schema_snapshot_is_refetched(self, ods):
+        """
+        库里那批老快照必须被排进重抓队列。
+
+        场景：P0 之前抓的 294 条详情，是用不认识「工作经验 / 职能类别 /
+        语言要求 / 招聘人数 / 完整地点」的解析器抓的。它们的列表指纹与
+        本次一模一样，靠规则 2/3 永远判不出「该重抓」，新字段会一直为空。
+        规则 4b 就是为这件事存在的。
+        """
+        states = self._states(ods, [make_job("1", schema_version=0)])
+        plan = plan_detail_fetch([make_job("1", detail=False)], states,
+                                 now=self.NOW)
+        assert plan.fetch_count == 1
+        assert plan.reasons["xmu:1"] == REASON_OUTDATED
+
+    def test_current_schema_snapshot_is_not_refetched(self, ods):
+        """
+        ★ 反面：已经是当前版本的快照，**不能**因为这条规则被重复抓。
+
+        否则就会出现「抓完还是旧版本」的死循环——每轮都重抓 294 条详情，
+        永远不会收敛。这条用例锁的就是「一轮抓完就收敛」。
+        """
+        assert DETAIL_SCHEMA_VERSION >= 1, "前提：当前版本号必须大于 0"
+        states = self._states(ods, [make_job("1")])
+        plan = plan_detail_fetch([make_job("1", detail=False)], states,
+                                 now=self.NOW)
+        assert plan.fetch_count == 0, "当前版本的快照不该重抓"
+        assert plan.reasons["xmu:1"] == REASON_UNCHANGED
+
+    def test_schema_rule_can_be_turned_off(self, ods):
+        """把目标版本显式传 0，等于关掉这条规则（排查时用）"""
+        states = self._states(ods, [make_job("1", schema_version=0)])
+        plan = plan_detail_fetch([make_job("1", detail=False)], states,
+                                 schema_version=0, now=self.NOW)
+        assert plan.fetch_count == 0
+        assert plan.reasons["xmu:1"] == REASON_UNCHANGED
+
+    def test_outdated_is_judged_before_stale(self, ods):
+        """
+        规则顺序：版本旧 + 数据也超期时，报「补新增字段」而不是「超期刷新」。
+
+        两条都会触发重抓，所以不影响请求数；但统计口径不同——
+        混在一起就说不清"这轮重抓是为了补字段还是例行刷新"。
+        """
+        old = datetime(2026, 9, 1, 10, 0, 0).strftime("%Y-%m-%d %H:%M:%S")
+        ods.save_snapshots("b1", [make_job("1", schema_version=0)],
+                           crawled_at=old)
+        plan = plan_detail_fetch([make_job("1", detail=False)],
+                                 ods.latest_states(), ttl_days=7, now=self.NOW)
+        assert plan.reasons["xmu:1"] == REASON_OUTDATED
+        assert plan.reasons["xmu:1"] != REASON_STALE
+
+    def test_schema_rule_respects_rule_order(self, ods):
+        """新岗位优先报「新岗位」——版本规则不该抢走更具体的原因"""
+        plan = plan_detail_fetch([make_job("9", detail=False)], {},
+                                 now=self.NOW)
+        assert plan.reasons["xmu:9"] == REASON_NEW
 
     # ---- 规则 5：详情数据超期 ----
     def test_stale_detail_is_refreshed(self, ods):
@@ -779,11 +923,23 @@ class TestIncrementalEndToEnd:
         ods.open_batch(batch_id, "incremental")
         plan = plan_detail_fetch(list_jobs, ods.latest_states(), now=now, **kw)
 
-        # 模拟「只对 plan.to_fetch 里的岗位抓详情」
+        # 模拟「只对 plan.to_fetch 里的岗位抓详情」。
+        # 这里必须完整模拟 spiders/xmu_career.py 里 _fetch_detail_loop 的动作，
+        # 尤其是**盖解析器版本号**：真实抓取会把 job.detail_schema_version
+        # 设成当前版本。若这里漏掉，快照就永远停留在版本 0，下一轮会被
+        # 规则 4b 判成「旧解析器快照」而全部重抓——测试会以「增量失效」
+        # 的形式失败，但根因在模拟不完整，不在判定逻辑。
         for job in plan.to_fetch:
             job.major_requirement = "数学类、信息与计算科学"
             job.deadline = "2026-10-01"
             job.detail_fetched = True
+            job.detail_schema_version = DETAIL_SCHEMA_VERSION
+            # 五个只有详情页才有的字段（2026-09-24 新增）
+            job.experience = "不限"
+            job.job_category = "计算机/互联网类"
+            job.language_req = "英语"
+            job.headcount = "5"
+            job.city_detail = "福建省厦门市思明区"
         apply_backfill(plan)
 
         ods.save_snapshots(batch_id, list_jobs)

@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     industry        TEXT,
     company_nature  TEXT,
     company_scale   TEXT,
+    -- ---- 岗位属性（2026-09-24 新增）----
+    -- 与 industry 等三项同理：这些字段进了内容指纹，
+    -- 所以必须存在表里，否则 load_all_jobs → 重算写回时
+    -- 会算出不同的内容指纹，change_count 虚增（见 core/models.py）
+    experience      TEXT,
+    job_category    TEXT,
+    language_req    TEXT,
+    headcount       TEXT,
+    city_detail     TEXT,
     match_score     INTEGER DEFAULT 0,
     match_level     TEXT,
     match_label     TEXT,
@@ -103,6 +112,12 @@ MIGRATION_COLUMNS = {
     "industry": "TEXT",
     "company_nature": "TEXT",
     "company_scale": "TEXT",
+    # 岗位属性（2026-09-24 新增）
+    "experience": "TEXT",
+    "job_category": "TEXT",
+    "language_req": "TEXT",
+    "headcount": "TEXT",
+    "city_detail": "TEXT",
 }
 
 
@@ -110,7 +125,8 @@ INSERT_SQL = """
 INSERT INTO jobs
     (company, title, city, salary, education, major_requirement,
      apply_method, deadline, source, url, industry, company_nature,
-     company_scale, match_score,
+     company_scale, experience, job_category, language_req, headcount,
+     city_detail, match_score,
      match_level, match_label, hit_keywords, crawl_time,
      job_key, source_job_id, publish_date,
      first_seen_at, last_seen_at, last_batch_id,
@@ -118,7 +134,8 @@ INSERT INTO jobs
 VALUES
     (:company, :title, :city, :salary, :education, :major_requirement,
      :apply_method, :deadline, :source, :url, :industry, :company_nature,
-     :company_scale, :match_score,
+     :company_scale, :experience, :job_category, :language_req, :headcount,
+     :city_detail, :match_score,
      :match_level, :match_label, :hit_keywords, :crawl_time,
      :job_key, :source_job_id, :publish_date,
      :now, :now, :last_batch_id,
@@ -149,6 +166,11 @@ UPDATE jobs SET
     industry          = COALESCE(NULLIF(:industry, ''), industry),
     company_nature    = COALESCE(NULLIF(:company_nature, ''), company_nature),
     company_scale     = COALESCE(NULLIF(:company_scale, ''), company_scale),
+    experience        = COALESCE(NULLIF(:experience, ''), experience),
+    job_category      = COALESCE(NULLIF(:job_category, ''), job_category),
+    language_req      = COALESCE(NULLIF(:language_req, ''), language_req),
+    headcount         = COALESCE(NULLIF(:headcount, ''), headcount),
+    city_detail       = COALESCE(NULLIF(:city_detail, ''), city_detail),
     match_score       = :match_score,
     match_level       = :match_level,
     match_label       = :match_label,
@@ -356,7 +378,12 @@ class JobStorage:
         """
         from core.models import Job as _Job
 
-        snapshots = ods.latest_snapshots()
+        # 用 build_source_rows() 而不是 latest_snapshots()：
+        # 后者只取「每个岗位的最新一条快照」，而最新那条可能是
+        # 「跳过了详情」写下的，详情字段为空——直接重放会把有值的字段洗掉。
+        # build_source_rows() 已经对详情字段做了「缺失就退回最近详情快照」
+        # 的兜底，正是重建想要的语义。
+        snapshots = ods.build_source_rows()
         states = ods.latest_states()
 
         jobs: List[Job] = []
@@ -378,6 +405,11 @@ class JobStorage:
                 industry=row["industry"] or "",
                 company_nature=row["company_nature"] or "",
                 company_scale=row["company_scale"] or "",
+                experience=row["experience"] or "",
+                job_category=row["job_category"] or "",
+                language_req=row["language_req"] or "",
+                headcount=row["headcount"] or "",
+                city_detail=row["city_detail"] or "",
                 job_key=key,
                 source_job_id=row["source_job_id"] or "",
                 crawl_time=row["crawled_at"] or "",
@@ -518,6 +550,11 @@ class JobStorage:
                 industry=r["industry"] or "",
                 company_nature=r["company_nature"] or "",
                 company_scale=r["company_scale"] or "",
+                experience=r["experience"] or "",
+                job_category=r["job_category"] or "",
+                language_req=r["language_req"] or "",
+                headcount=r["headcount"] or "",
+                city_detail=r["city_detail"] or "",
                 match_score=r["match_score"], match_level=r["match_level"],
                 match_label=r["match_label"],
                 hit_keywords=[k for k in kw.split(",") if k],
