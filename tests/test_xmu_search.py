@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import MAJOR_CODES, DEFAULT_MAJOR_KEYS  # noqa: E402
 from core.decoder import decode_embedded_html, probe_encoding, unzip_base64  # noqa: E402
+from core.models import Job, make_job_key  # noqa: E402
 from spiders.xmu_career import SearchProfile, XmuCareerSpider  # noqa: E402
 
 
@@ -462,6 +463,117 @@ class TestCompanyBlock:
         assert job.industry == "制造业"
         assert job.company_nature == "国有企业"
         assert job.company_scale == "1000-5000人"
+
+
+class TestDetailCircuitBreaker:
+    """
+    详情阶段的止损闸（2026-09-23 新增）。
+
+    背景：一次 296 条的详情抓取约 10 分钟，中途站点抽风时每条失败要耗
+    3 次重试约 7 秒，剩余 200 条会白烧一小时，最后还一条都存不下。
+    连续失败说明「站点整体不可用」，应当迅速放弃、先落库已抓到的部分。
+
+    这里的测试不打网络：直接把 _fetch_job_page 换成假实现，
+    只验证「判定与中止」的逻辑本身。
+    """
+
+    @staticmethod
+    def _jobs(n: int):
+        return [
+            Job(company=f"公司{i}", title=f"岗位{i}",
+                url=f"https://jy.xmu.edu.cn/job/view/id/{1000 + i}",
+                source_job_id=str(1000 + i),
+                job_key=make_job_key(str(1000 + i)))
+            for i in range(n)
+        ]
+
+    def _spider(self, outcomes):
+        """
+        :param outcomes: 每次调用 _fetch_job_page 的结果，True=成功 / False=失败；
+                         用尽后一律失败，且记录实际调用次数
+        """
+        spider = XmuCareerSpider(fetch_detail=True, detail_delay=0)
+        calls = {"n": 0}
+
+        def fake_fetch(jid):
+            idx = calls["n"]
+            calls["n"] += 1
+            ok = outcomes[idx] if idx < len(outcomes) else False
+            if not ok:
+                return None
+            # 与真实 _fetch_job_page 的契约保持一致：成功要自己记一次 detail_ok，
+            # 循环体只负责 detail_major_found。少这一笔会让统计与真实运行不符。
+            spider.stats["detail_ok"] += 1
+            job = Job(company="X", title="Y",
+                      major_requirement="数学类",
+                      company_nature="国有企业",
+                      url=f"https://jy.xmu.edu.cn/job/view/id/{jid}")
+            return job
+
+        spider._fetch_job_page = fake_fetch
+        return spider, calls
+
+    def test_aborts_after_consecutive_failures(self):
+        """★ 连续失败到阈值就中止，不再把剩下的请求发出去"""
+        from config import DETAIL_MAX_CONSECUTIVE_FAILURES as LIMIT
+
+        total = LIMIT + 50
+        jobs = self._jobs(total)
+        spider, calls = self._spider([])          # 全失败
+
+        spider._fetch_detail_loop(jobs)
+
+        assert calls["n"] == LIMIT, "到达阈值后必须立刻停止发请求"
+        assert spider.stats["detail_aborted"] == total - LIMIT
+        assert all(not j.detail_fetched for j in jobs)
+
+    def test_success_resets_failure_streak(self):
+        """
+        偶发失败不能触发中止。
+
+        真实情况里中间夹着个别 404 很正常（岗位已被撤下），
+        只有「连续」失败才说明站点整体不可用。
+        """
+        from config import DETAIL_MAX_CONSECUTIVE_FAILURES as LIMIT
+
+        # 每两次成功夹一次失败：连续失败数永远到不了阈值
+        outcomes = [True, False] * 60
+        jobs = self._jobs(100)
+        spider, calls = self._spider(outcomes)
+
+        spider._fetch_detail_loop(jobs)
+
+        assert calls["n"] == 100, "不该中止"
+        assert spider.stats["detail_aborted"] == 0
+        assert spider.stats["detail_ok"] == 50
+
+    def test_partial_success_is_kept(self):
+        """中止前成功抓到的详情必须保留（这是「早停」而不是「丢弃」）"""
+        from config import DETAIL_MAX_CONSECUTIVE_FAILURES as LIMIT
+
+        jobs = self._jobs(LIMIT + 20)
+        # 先成功 5 条，然后一路失败
+        spider, _ = self._spider([True] * 5)
+        spider._fetch_detail_loop(jobs)
+
+        assert spider.stats["detail_ok"] == 5
+        assert spider.stats["detail_major_found"] == 5
+        for j in jobs[:5]:
+            assert j.detail_fetched is True
+            assert j.major_requirement == "数学类"
+
+    def test_can_be_disabled(self, monkeypatch):
+        """阈值设为 0 表示关闭保护：全部失败也要跑完（不静默改变旧行为）"""
+        import spiders.xmu_career as mod
+
+        monkeypatch.setattr(mod, "DETAIL_MAX_CONSECUTIVE_FAILURES", 0)
+
+        jobs = self._jobs(50)
+        spider, calls = self._spider([])
+        spider._fetch_detail_loop(jobs)
+
+        assert calls["n"] == 50
+        assert spider.stats["detail_aborted"] == 0
 
 
 # ===================================================================

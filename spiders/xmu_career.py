@@ -146,6 +146,7 @@ from config import (
     SEARCH_MAX_PAGES,
     CITY_CODES, EDUCATION_CODES, CATEGORY_CODES, TIME_CODES,
     NATURE_CODES, SCALE_CODES, MAJOR_CODES, DEFAULT_MAJOR_KEYS,
+    DETAIL_MAX_CONSECUTIVE_FAILURES,
 )
 from core.decoder import decode_embedded_html, probe_encoding
 from core.models import Job, make_job_key, list_fingerprint
@@ -332,6 +333,8 @@ class XmuCareerSpider(BaseSpider):
             # ---- 增量相关（2026-09-21 新增）----
             "detail_skipped": 0,     # 因增量判定而省下的详情请求数
             "backfilled": 0,         # 用历史快照回填了专业字段的岗位数
+            # ---- 止损相关（2026-09-23 新增）----
+            "detail_aborted": 0,     # 因连续失败而放弃抓取的详情条数
         }
 
     # -----------------------------------------------------------------
@@ -659,6 +662,8 @@ class XmuCareerSpider(BaseSpider):
                          "预计约 %.1f 分钟",
                          len(target), len(target) * self.detail_delay / 60)
 
+        consecutive_failures = 0
+
         for i, job in enumerate(target, 1):
             jid = self._jid_of(job.url)
             if not jid:
@@ -666,6 +671,7 @@ class XmuCareerSpider(BaseSpider):
 
             detail = self._fetch_job_page(jid)
             if detail:
+                consecutive_failures = 0
                 job.major_requirement = detail.major_requirement or ""
                 if detail.deadline:
                     job.deadline = detail.deadline
@@ -681,10 +687,25 @@ class XmuCareerSpider(BaseSpider):
                 job.detail_fetched = True
                 if job.major_requirement:
                     self.stats["detail_major_found"] += 1
+            else:
+                # 连续失败计数：偶发失败（个别岗位 404）靠增量下次重试即可，
+                # 但连着失败说明整站不可用，继续只会把时间烧在必失败的请求上。
+                consecutive_failures += 1
 
             if i % 20 == 0 or i == len(target):
                 self.logger.info("  详情进度 %d/%d（已取到专业 %d 条）",
                                  i, len(target), self.stats["detail_major_found"])
+
+            if (DETAIL_MAX_CONSECUTIVE_FAILURES
+                    and consecutive_failures >= DETAIL_MAX_CONSECUTIVE_FAILURES):
+                remaining = len(target) - i
+                self.stats["detail_aborted"] = remaining
+                self.logger.error(
+                    "连续 %d 条详情请求失败，判定为目标站点不可用，"
+                    "提前中止剩余 %d 条抓取。已抓到的数据会正常落库，"
+                    "未抓的部分下次运行增量补上。",
+                    consecutive_failures, remaining)
+                break
 
             if i < len(target):
                 time.sleep(self.detail_delay)
